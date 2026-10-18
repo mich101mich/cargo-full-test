@@ -1,0 +1,15 @@
+[package]
+name = "cargo-full-test"
+version = "0.1.0"
+edition = "2024"
+description = "Parallel full test, lint, coverage, MSRV, and minimal-versions runner"
+
+[dependencies]
+anyhow = "1.0.95"
+cargo_metadata = "0.23.0"
+clap = { version = "4.5.20", features = ["derive"] }
+console = "0.16.0"
+fs-err = { version = "3.2.0", features = ["debug"] }
+indicatif = "0.18.0"
+serde = { version = "1.0.210", features = ["derive"] }
+serde_json = "1.0.128"

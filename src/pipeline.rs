@@ -1,0 +1,243 @@
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::time::Instant;
+
+use anyhow::{Result, bail};
+use indicatif::MultiProgress;
+
+use crate::config::Config;
+use crate::runner::TrackRunner;
+use crate::test_dir::{IsolatedDir, prepare_isolated_test_dir};
+
+/// Runs the full test pipeline (Setup -> Parallel Base / MSRV / Minimal-Versions -> Summary).
+pub fn run_pipeline(config: &Config) -> Result<()> {
+    let start_time = Instant::now();
+
+    verify_required_executables()?;
+
+    // Ensure coverage directories exist
+    let cov_base = config.base_dir.join("target").join("cov");
+    fs_err::create_dir_all(cov_base.join("nightly"))?;
+    if config.run_error_message_tests {
+        fs_err::create_dir_all(cov_base.join("err_stable"))?;
+        fs_err::create_dir_all(cov_base.join("err_nightly"))?;
+    }
+
+    let multi_progress = MultiProgress::new();
+    let cancelled = Arc::new(AtomicBool::new(false));
+
+    // Phase 1: Pre-flight & Setup (Sequential)
+    run_setup_phase(config, &multi_progress, Arc::clone(&cancelled))?;
+
+    let msrv_dir_name = format!("msrv_{}", config.msrv);
+    let msrv_dir = prepare_isolated_test_dir(&config.base_dir, &msrv_dir_name)?;
+    let min_versions_dir = prepare_isolated_test_dir(&config.base_dir, "min_versions")?;
+
+    // Phase 2: Parallel Test Tracks
+    let base_runner = TrackRunner::new(
+        "base",
+        "Base",
+        &config.base_dir,
+        &config.base_dir,
+        &multi_progress,
+        Arc::clone(&cancelled),
+    )?;
+    let msrv_runner = TrackRunner::new(
+        "msrv",
+        &format!("MSRV ({})", config.msrv),
+        &config.base_dir,
+        &msrv_dir.work_dir,
+        &multi_progress,
+        Arc::clone(&cancelled),
+    )?;
+    let min_versions_runner = TrackRunner::new(
+        "min_versions",
+        "MinVersions",
+        &config.base_dir,
+        &min_versions_dir.work_dir,
+        &multi_progress,
+        Arc::clone(&cancelled),
+    )?;
+
+    let (base_res, msrv_res, min_res) = std::thread::scope(|s| {
+        let base_handle = s.spawn(|| run_base_track(config, base_runner));
+        let msrv_handle = s.spawn(|| run_msrv_track(config, &msrv_dir, msrv_runner));
+        let min_handle =
+            s.spawn(|| run_min_versions_track(config, &min_versions_dir, min_versions_runner));
+
+        let r1 = base_handle
+            .join()
+            .unwrap_or_else(|_| bail!("Base track thread panicked"));
+        let r2 = msrv_handle
+            .join()
+            .unwrap_or_else(|_| bail!("MSRV track thread panicked"));
+        let r3 = min_handle
+            .join()
+            .unwrap_or_else(|_| bail!("Minimal-Versions track thread panicked"));
+        (r1, r2, r3)
+    });
+
+    base_res?;
+    msrv_res?;
+    min_res?;
+
+    // Phase 3: Completion Summary
+    let elapsed = start_time.elapsed().as_secs();
+    println!("All tests passed in {elapsed} seconds!");
+
+    Ok(())
+}
+
+fn verify_required_executables() -> Result<()> {
+    for cmd in ["rustup", "cargo", "git"] {
+        let ok = Command::new(cmd)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+
+        if !ok {
+            bail!("cargo-full-test requires command '{cmd}' in PATH. Please install it.");
+        }
+    }
+    Ok(())
+}
+
+fn run_setup_phase(
+    config: &Config,
+    multi_progress: &MultiProgress,
+    cancelled: Arc<AtomicBool>,
+) -> Result<()> {
+    let runner = TrackRunner::new(
+        "setup",
+        "Setup",
+        &config.base_dir,
+        &config.base_dir,
+        multi_progress,
+        cancelled,
+    )?;
+
+    runner.run_cmd("rustup", &["update"])?;
+    runner.run_cmd("rustup", &["install", "stable"])?;
+    runner.run_cmd("rustup", &["install", "nightly"])?;
+    runner.run_cmd("rustup", &["install", &config.msrv])?;
+    runner.run_cmd(
+        "rustup",
+        &[
+            "component",
+            "add",
+            "--toolchain",
+            "stable",
+            "rustfmt",
+            "rust-src",
+            "llvm-tools-preview",
+        ],
+    )?;
+    runner.run_cmd(
+        "rustup",
+        &[
+            "component",
+            "add",
+            "--toolchain",
+            "nightly",
+            "clippy",
+            "rust-src",
+            "llvm-tools-preview",
+        ],
+    )?;
+    runner.run_cmd("cargo", &["install", "cargo-llvm-cov"])?;
+
+    runner.finish("Done");
+    Ok(())
+}
+
+fn run_base_track(config: &Config, mut runner: TrackRunner) -> Result<()> {
+    let target_dir = config.base_dir.join("target");
+    runner.set_env("CARGO_TARGET_DIR", target_dir.to_string_lossy());
+    runner.set_env("CARGO_BUILD_WARNINGS", "deny");
+    runner.set_env("RUSTDOCFLAGS", "-D warnings");
+    runner.remove_env("RUSTFLAGS");
+
+    runner.run_cmd("cargo", &["update"])?;
+    runner.run_cmd("cargo", &["+stable", "test", "--workspace"])?;
+    runner.run_coverage("nightly", "nightly", &["--workspace"])?;
+    runner.run_cmd("cargo", &["+nightly", "doc", "--no-deps", "--workspace"])?;
+    runner.run_cmd(
+        "cargo",
+        &["+nightly", "clippy", "--workspace", "--", "-D", "warnings"],
+    )?;
+    runner.run_cmd("cargo", &["+stable", "fmt", "--check", "--all"])?;
+
+    if config.run_error_message_tests {
+        if config.frozen {
+            runner.set_env("ERR_SPAN_CHECK", "frozen");
+        }
+        runner.run_coverage(
+            "stable",
+            "err_stable",
+            &["error_message_tests", "--workspace", "--", "--ignored"],
+        )?;
+        runner.run_coverage(
+            "nightly",
+            "err_nightly",
+            &["error_message_tests", "--workspace", "--", "--ignored"],
+        )?;
+    }
+
+    runner.finish("Passed");
+    Ok(())
+}
+
+fn run_msrv_track(config: &Config, msrv_dir: &IsolatedDir, mut runner: TrackRunner) -> Result<()> {
+    runner.set_env(
+        "CARGO_TARGET_DIR",
+        msrv_dir.cargo_target_dir.to_string_lossy(),
+    );
+    runner.set_env("RUSTFLAGS", "-D warnings");
+    runner.remove_env("CARGO_BUILD_WARNINGS");
+
+    let plus_msrv = format!("+{}", config.msrv);
+    runner.run_cmd("cargo", &[&plus_msrv, "update"])?;
+
+    for ovr in &config.msrv_overrides {
+        runner.run_cmd(
+            "cargo",
+            &[
+                &plus_msrv,
+                "update",
+                "-p",
+                &ovr.package,
+                "--precise",
+                &ovr.version,
+            ],
+        )?;
+    }
+
+    runner.run_cmd("cargo", &[&plus_msrv, "test", "--workspace"])?;
+
+    runner.finish("Passed");
+    Ok(())
+}
+
+fn run_min_versions_track(
+    _config: &Config,
+    min_versions_dir: &IsolatedDir,
+    mut runner: TrackRunner,
+) -> Result<()> {
+    runner.set_env(
+        "CARGO_TARGET_DIR",
+        min_versions_dir.cargo_target_dir.to_string_lossy(),
+    );
+    runner.set_env("CARGO_BUILD_WARNINGS", "deny");
+    runner.set_env("RUSTDOCFLAGS", "-D warnings");
+    runner.remove_env("RUSTFLAGS");
+
+    runner.run_cmd("cargo", &["+nightly", "-Z", "minimal-versions", "update"])?;
+    runner.run_cmd("cargo", &["+stable", "test", "--workspace"])?;
+    runner.run_cmd("cargo", &["+nightly", "test", "--workspace"])?;
+
+    runner.finish("Passed");
+    Ok(())
+}
