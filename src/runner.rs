@@ -1,11 +1,35 @@
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    ffi::OsString,
+    io::{BufRead, BufReader, Write},
+};
 
 use anyhow::{Context, Result, bail};
 use indicatif::ProgressBar;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Toolchain {
+    Stable,
+    Nightly,
+    Specific(String),
+}
+impl<'a> From<&'a String> for Toolchain {
+    fn from(raw: &'a String) -> Self {
+        Self::Specific(raw.to_owned())
+    }
+}
+impl std::fmt::Display for Toolchain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Toolchain::Stable => write!(f, "+stable"),
+            Toolchain::Nightly => write!(f, "+nightly"),
+            Toolchain::Specific(version) => write!(f, "+{version}"),
+        }
+    }
+}
 
 /// Execution context for a single track (e.g. `Setup`, `Base`, `MSRV`, `MinVersions`).
 #[derive(Debug)]
@@ -19,7 +43,7 @@ pub struct TrackRunner {
     /// Path to the track's log file (`<base_dir>/target/test_<track_id>.log`).
     pub log_path: PathBuf,
     /// Environment variables to set on every command in this track.
-    pub env_set: Vec<(String, String)>,
+    pub env_set: Vec<(String, OsString)>,
     /// Environment variables to remove on every command in this track.
     pub env_remove: Vec<String>,
     /// Live progress bar for this track.
@@ -55,7 +79,7 @@ impl TrackRunner {
     }
 
     /// Sets an environment variable for commands in this track.
-    pub fn set_env(&mut self, key: impl Into<String>, val: impl Into<String>) {
+    pub fn set_env(&mut self, key: impl Into<String>, val: impl Into<OsString>) {
         let key = key.into();
         let val = val.into();
         if let Some((_, existing)) = self.env_set.iter_mut().find(|(k, _)| k == &key) {
@@ -89,27 +113,15 @@ impl TrackRunner {
         self.pb.set_message(format!("Running {cmd_str}"));
 
         let mut log_file = fs_err::File::create(&self.log_path)?;
+        let log_path_name = self.log_path.display();
         writeln!(
             log_file,
-            "################################################################################"
-        )?;
-        writeln!(log_file, "### Log for {cmd_str}")?;
-        writeln!(
-            log_file,
-            "### This file is meant to be output to a terminal, so it still contains escape"
-        )?;
-        writeln!(
-            log_file,
-            "### sequences for coloring. If you want to read the log, use"
-        )?;
-        writeln!(
-            log_file,
-            "###     tail -n +7 \"{}\"",
-            self.log_path.display()
-        )?;
-        writeln!(
-            log_file,
-            "################################################################################"
+            r#"################################################################################
+### Log for {cmd_str}
+### This file is meant to be output to a terminal, so it still contains escape
+### sequences for coloring. If you want to read the log, use
+###     tail -n +7 "{log_path_name}"
+################################################################################"#
         )?;
 
         let (reader, writer) = std::io::pipe().context("Failed to create OS pipe")?;
@@ -187,16 +199,30 @@ impl TrackRunner {
         Ok(())
     }
 
+    pub fn run_cargo(&self, toolchain: impl Into<Toolchain>, args: &[&str]) -> Result<()> {
+        let plus_toolchain = toolchain.into().to_string();
+        let mut cmd_args = vec![plus_toolchain.as_str()];
+        cmd_args.extend_from_slice(args);
+        self.run_cmd("cargo", &cmd_args)
+    }
+
+    pub fn run_rustup(&self, args: &[&str]) -> Result<()> {
+        self.run_cmd("rustup", args)
+    }
+
     /// Runs `cargo +<toolchain> llvm-cov test --lcov --output-path target/cov/<cov_name>/lcov.info <extra_args...>`.
-    pub fn run_coverage(&self, toolchain: &str, cov_name: &str, extra_args: &[&str]) -> Result<()> {
+    pub fn run_coverage(
+        &self,
+        toolchain: impl Into<Toolchain>,
+        cov_name: &str,
+        extra_args: &[&str],
+    ) -> Result<()> {
         let cov_dir = self.base_dir.join("target").join("cov").join(cov_name);
         fs_err::create_dir_all(&cov_dir)?;
 
         let output_path = format!("target/cov/{cov_name}/lcov.info");
-        let plus_toolchain = format!("+{toolchain}");
 
         let mut args = vec![
-            plus_toolchain.as_str(),
             "llvm-cov",
             "test",
             "--lcov",
@@ -205,7 +231,7 @@ impl TrackRunner {
         ];
         args.extend_from_slice(extra_args);
 
-        self.run_cmd("cargo", &args)
+        self.run_cargo(toolchain, &args)
     }
 
     /// Marks the track progress spinner as finished.

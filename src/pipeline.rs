@@ -10,7 +10,10 @@ use anyhow::{Result, bail};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use crate::config::Config;
-use crate::runner::TrackRunner;
+use crate::runner::{
+    Toolchain::{Nightly, Stable},
+    TrackRunner,
+};
 use crate::test_dir::{IsolatedDir, prepare_isolated_test_dir};
 
 /// Runs the full test pipeline (Setup -> Parallel Base / MSRV / Minimal-Versions -> Summary).
@@ -151,35 +154,29 @@ fn run_setup_phase(config: &Config, pb: ProgressBar, cancelled: Arc<AtomicBool>)
         cancelled,
     )?;
 
-    runner.run_cmd("rustup", &["update"])?;
-    runner.run_cmd("rustup", &["install", "stable"])?;
-    runner.run_cmd("rustup", &["install", "nightly"])?;
-    runner.run_cmd("rustup", &["install", &config.msrv])?;
-    runner.run_cmd(
-        "rustup",
-        &[
-            "component",
-            "add",
-            "--toolchain",
-            "stable",
-            "rustfmt",
-            "rust-src",
-            "llvm-tools-preview",
-        ],
-    )?;
-    runner.run_cmd(
-        "rustup",
-        &[
-            "component",
-            "add",
-            "--toolchain",
-            "nightly",
-            "clippy",
-            "rust-src",
-            "llvm-tools-preview",
-        ],
-    )?;
-    runner.run_cmd("cargo", &["install", "cargo-llvm-cov"])?;
+    runner.run_rustup(&["update"])?;
+    runner.run_rustup(&["install", "stable"])?;
+    runner.run_rustup(&["install", "nightly"])?;
+    runner.run_rustup(&["install", &config.msrv])?;
+    runner.run_rustup(&[
+        "component",
+        "add",
+        "--toolchain",
+        "stable",
+        "rustfmt",
+        "rust-src",
+        "llvm-tools-preview",
+    ])?;
+    runner.run_rustup(&[
+        "component",
+        "add",
+        "--toolchain",
+        "nightly",
+        "clippy",
+        "rust-src",
+        "llvm-tools-preview",
+    ])?;
+    runner.run_cargo(Stable, &["install", "cargo-llvm-cov"])?;
 
     runner.finish("Done");
     Ok(())
@@ -187,89 +184,72 @@ fn run_setup_phase(config: &Config, pb: ProgressBar, cancelled: Arc<AtomicBool>)
 
 fn configure_base_env(config: &Config, runner: &mut TrackRunner) {
     let target_dir = config.base_dir.join("target");
-    runner.set_env("CARGO_TARGET_DIR", target_dir.to_string_lossy());
+    runner.set_env("CARGO_TARGET_DIR", &target_dir);
     runner.set_env("CARGO_BUILD_WARNINGS", "deny");
     runner.set_env("RUSTDOCFLAGS", "-D warnings");
     runner.remove_env("RUSTFLAGS");
 }
 
 fn configure_msrv_env(msrv_dir: &IsolatedDir, runner: &mut TrackRunner) {
-    runner.set_env(
-        "CARGO_TARGET_DIR",
-        msrv_dir.cargo_target_dir.to_string_lossy(),
-    );
+    runner.set_env("CARGO_TARGET_DIR", &msrv_dir.cargo_target_dir);
     runner.set_env("RUSTFLAGS", "-D warnings");
     runner.remove_env("CARGO_BUILD_WARNINGS");
 }
 
 fn configure_min_versions_env(min_versions_dir: &IsolatedDir, runner: &mut TrackRunner) {
-    runner.set_env(
-        "CARGO_TARGET_DIR",
-        min_versions_dir.cargo_target_dir.to_string_lossy(),
-    );
+    runner.set_env("CARGO_TARGET_DIR", &min_versions_dir.cargo_target_dir);
     runner.set_env("CARGO_BUILD_WARNINGS", "deny");
     runner.set_env("RUSTDOCFLAGS", "-D warnings");
     runner.remove_env("RUSTFLAGS");
 }
 
 fn prepare_base_deps(runner: &mut TrackRunner) -> Result<()> {
-    runner.run_cmd("cargo", &["update"])?;
-    runner.run_cmd("cargo", &["+stable", "fetch"])?;
+    runner.run_cargo(Stable, &["update"])?;
+    runner.run_cargo(Stable, &["fetch"])?;
     runner.set_env("CARGO_NET_OFFLINE", "true");
     Ok(())
 }
 
 fn prepare_msrv_deps(config: &Config, runner: &mut TrackRunner) -> Result<()> {
-    let plus_msrv = format!("+{}", config.msrv);
-    runner.run_cmd("cargo", &[&plus_msrv, "update"])?;
+    runner.run_cargo(&config.msrv, &["update"])?;
 
     for ovr in &config.msrv_overrides {
-        runner.run_cmd(
-            "cargo",
-            &[
-                &plus_msrv,
-                "update",
-                "-p",
-                &ovr.package,
-                "--precise",
-                &ovr.version,
-            ],
+        runner.run_cargo(
+            &config.msrv,
+            &["update", "-p", &ovr.package, "--precise", &ovr.version],
         )?;
     }
 
-    runner.run_cmd("cargo", &[&plus_msrv, "fetch"])?;
+    runner.run_cargo(&config.msrv, &["fetch"])?;
     runner.set_env("CARGO_NET_OFFLINE", "true");
     Ok(())
 }
 
 fn prepare_min_versions_deps(runner: &mut TrackRunner) -> Result<()> {
-    runner.run_cmd("cargo", &["+nightly", "-Z", "minimal-versions", "update"])?;
-    runner.run_cmd("cargo", &["+stable", "fetch"])?;
+    runner.run_cargo(Nightly, &["-Z", "minimal-versions", "update"])?;
+    runner.run_cargo(Stable, &["fetch"])?;
     runner.set_env("CARGO_NET_OFFLINE", "true");
     Ok(())
 }
 
 fn run_base_track(config: &Config, mut runner: TrackRunner) -> Result<()> {
-    runner.run_cmd("cargo", &["+stable", "test", "--workspace"])?;
-    runner.run_coverage("nightly", "nightly", &["--workspace"])?;
-    runner.run_cmd("cargo", &["+nightly", "doc", "--no-deps", "--workspace"])?;
-    runner.run_cmd(
-        "cargo",
-        &["+nightly", "clippy", "--workspace", "--", "-D", "warnings"],
-    )?;
-    runner.run_cmd("cargo", &["+stable", "fmt", "--check", "--all"])?;
+    runner.run_cargo(Stable, &["test", "--workspace"])?;
+    runner.run_coverage(Nightly, "nightly", &["--workspace"])?;
+    runner.run_cargo(Nightly, &["doc", "--no-deps", "--workspace"])?;
+    runner.run_cargo(Nightly, &["clippy", "--workspace", "--", "-D", "warnings"])?;
+    runner.run_cargo(Stable, &["fmt", "--check", "--all"])?;
 
     if config.run_error_message_tests {
         if config.frozen {
             runner.set_env("ERR_SPAN_CHECK", "frozen");
         }
         runner.run_coverage(
-            "stable",
+            Stable,
             "err_stable",
             &["error_message_tests", "--workspace", "--", "--ignored"],
         )?;
         runner.run_coverage(
-            "nightly",
+            Nightly,
             "err_nightly",
             &["error_message_tests", "--workspace", "--", "--ignored"],
         )?;
@@ -280,16 +260,15 @@ fn run_base_track(config: &Config, mut runner: TrackRunner) -> Result<()> {
 }
 
 fn run_msrv_track(config: &Config, runner: TrackRunner) -> Result<()> {
-    let plus_msrv = format!("+{}", config.msrv);
-    runner.run_cmd("cargo", &[&plus_msrv, "test", "--workspace"])?;
+    runner.run_cargo(&config.msrv, &["test", "--workspace"])?;
 
     runner.finish("Passed");
     Ok(())
 }
 
 fn run_min_versions_track(runner: TrackRunner) -> Result<()> {
-    runner.run_cmd("cargo", &["+stable", "test", "--workspace"])?;
-    runner.run_cmd("cargo", &["+nightly", "test", "--workspace"])?;
+    runner.run_cargo(Stable, &["test", "--workspace"])?;
+    runner.run_cargo(Nightly, &["test", "--workspace"])?;
 
     runner.finish("Passed");
     Ok(())
