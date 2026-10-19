@@ -1,14 +1,14 @@
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::{
-    ffi::OsString,
-    io::{BufRead, BufReader, Write},
-};
 
 use anyhow::{Context, Result, bail};
 use indicatif::ProgressBar;
+
+use crate::workspace::Workspace;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Toolchain {
@@ -31,15 +31,25 @@ impl std::fmt::Display for Toolchain {
     }
 }
 
+#[derive(Debug)]
+pub struct Shared {
+    /// Directory for storing log files.
+    pub log_dir: PathBuf,
+    /// Directory for storing coverage output.
+    pub cov_base_dir: PathBuf,
+    /// Shared cancellation flag across tracks.
+    pub cancelled: AtomicBool,
+}
+
 /// Execution context for a single track (e.g. `Setup`, `Base`, `MSRV`, `MinVersions`).
 #[derive(Debug)]
 pub struct TrackRunner {
     /// Display name for the track (e.g., `"Base"`).
     pub display_name: String,
-    /// Root workspace directory (`<base_dir>`).
-    pub base_dir: PathBuf,
-    /// Working directory where commands are executed.
-    pub work_dir: PathBuf,
+    /// Directories associated with this track.
+    pub workspace: Workspace,
+    /// Shared information.
+    pub shared: Arc<Shared>,
     /// Path to the track's log file (`<base_dir>/target/test_<track_id>.log`).
     pub log_path: PathBuf,
     /// Environment variables to set on every command in this track.
@@ -48,8 +58,6 @@ pub struct TrackRunner {
     pub env_remove: Vec<String>,
     /// Live progress bar for this track.
     pub pb: ProgressBar,
-    /// Shared cancellation flag across tracks.
-    pub cancelled: Arc<AtomicBool>,
 }
 
 impl TrackRunner {
@@ -57,24 +65,26 @@ impl TrackRunner {
     pub fn new(
         track_id: &str,
         display_name: &str,
-        base_dir: &Path,
-        work_dir: &Path,
+        shared: Arc<Shared>,
+        workspace: Workspace,
         pb: ProgressBar,
-        cancelled: Arc<AtomicBool>,
     ) -> Result<Self> {
-        let target_dir = base_dir.join("target");
-        fs_err::create_dir_all(&target_dir)?;
-        let log_path = target_dir.join(format!("test_{track_id}.log"));
+        fs_err::create_dir_all(&shared.log_dir)?;
+        let log_path = shared.log_dir.join(format!("test_{track_id}.log"));
+
+        let env_set = vec![(
+            "CARGO_TARGET_DIR".into(),
+            workspace.cargo_target_dir.clone().into(),
+        )];
 
         Ok(Self {
             display_name: display_name.to_owned(),
-            base_dir: base_dir.to_path_buf(),
-            work_dir: work_dir.to_path_buf(),
+            workspace,
+            shared,
             log_path,
-            env_set: Vec::new(),
+            env_set,
             env_remove: Vec::new(),
             pb,
-            cancelled,
         })
     }
 
@@ -97,7 +107,7 @@ impl TrackRunner {
     /// Runs a command in this track's working directory, logging raw output to `self.log_path`
     /// and updating the live spinner with the most recent output line.
     pub fn run_cmd(&self, program: &str, args: &[&str]) -> Result<()> {
-        if self.cancelled.load(Ordering::Relaxed) {
+        if self.shared.cancelled.load(Ordering::Relaxed) {
             bail!(
                 "[{}] Cancelled due to failure in another track",
                 self.display_name
@@ -131,7 +141,7 @@ impl TrackRunner {
 
         let mut cmd = Command::new(program);
         cmd.args(args)
-            .current_dir(&self.work_dir)
+            .current_dir(&self.workspace.work_dir)
             .env("CARGO_TERM_COLOR", "always")
             .env("CARGO_CACHE_AUTO_CLEAN_FREQUENCY", "never") // avoid package lock from GC
             .stdout(Stdio::from(writer))
@@ -180,7 +190,7 @@ impl TrackRunner {
             .with_context(|| format!("Failed waiting for `{cmd_str}`"))?;
 
         if !status.success() {
-            self.cancelled.store(true, Ordering::Relaxed);
+            self.shared.cancelled.store(true, Ordering::Relaxed);
             self.pb.finish_and_clear();
             let mut stderr = std::io::stderr().lock();
             let _ = writeln!(
@@ -217,17 +227,17 @@ impl TrackRunner {
         cov_name: &str,
         extra_args: &[&str],
     ) -> Result<()> {
-        let cov_dir = self.base_dir.join("target").join("cov").join(cov_name);
-        fs_err::create_dir_all(&cov_dir)?;
+        fs_err::create_dir_all(&self.shared.cov_base_dir)?;
 
-        let output_path = format!("target/cov/{cov_name}/lcov.info");
+        let output_path = self.shared.cov_base_dir.join(cov_name).join("lcov.info");
+        let output_path = output_path.to_string_lossy();
 
         let mut args = vec![
             "llvm-cov",
             "test",
             "--lcov",
             "--output-path",
-            output_path.as_str(),
+            output_path.as_ref(),
         ];
         args.extend_from_slice(extra_args);
 

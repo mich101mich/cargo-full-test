@@ -11,10 +11,11 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use crate::config::Config;
 use crate::runner::{
+    Shared,
     Toolchain::{Nightly, Stable},
     TrackRunner,
 };
-use crate::test_dir::{IsolatedDir, prepare_isolated_test_dir};
+use crate::workspace::Workspace;
 
 /// Runs the full test pipeline (Setup -> Parallel Base / MSRV / Minimal-Versions -> Summary).
 pub fn run_pipeline(config: &Config) -> Result<()> {
@@ -31,18 +32,26 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
     }
 
     let multi_progress = MultiProgress::new();
-    let cancelled = Arc::new(AtomicBool::new(false));
+
+    let shared = Arc::new(Shared {
+        log_dir: config.base_dir.join("target").join("log"),
+        cov_base_dir: cov_base,
+        cancelled: AtomicBool::new(false),
+    });
+
+    let base_workspace = Workspace::new_base_dir(&config.base_dir);
 
     // Phase 1: Pre-flight & Setup (Sequential)
     run_setup_phase(
         config,
+        base_workspace.clone(),
         create_progress(&multi_progress, "Setup", 5),
-        Arc::clone(&cancelled),
+        Arc::clone(&shared),
     )?;
 
     let msrv_dir_name = format!("msrv_{}", config.msrv);
-    let msrv_dir = prepare_isolated_test_dir(&config.base_dir, &msrv_dir_name)?;
-    let min_versions_dir = prepare_isolated_test_dir(&config.base_dir, "min_versions")?;
+    let msrv_workspace = Workspace::new_isolated(&config.base_dir, &msrv_dir_name)?;
+    let min_versions_workspace = Workspace::new_isolated(&config.base_dir, "min_versions")?;
 
     let base_name = "Base";
     let msrv_name = &format!("MSRV ({})", config.msrv);
@@ -57,31 +66,28 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
     let mut base_runner = TrackRunner::new(
         "base",
         base_name,
-        &config.base_dir,
-        &config.base_dir,
+        Arc::clone(&shared),
+        base_workspace,
         create_progress(&multi_progress, base_name, name_length),
-        Arc::clone(&cancelled),
     )?;
     let mut msrv_runner = TrackRunner::new(
         "msrv",
         msrv_name,
-        &config.base_dir,
-        &msrv_dir.work_dir,
+        Arc::clone(&shared),
+        msrv_workspace,
         create_progress(&multi_progress, msrv_name, name_length),
-        Arc::clone(&cancelled),
     )?;
     let mut min_versions_runner = TrackRunner::new(
         "min_versions",
         min_versions_name,
-        &config.base_dir,
-        &min_versions_dir.work_dir,
+        Arc::clone(&shared),
+        min_versions_workspace,
         create_progress(&multi_progress, min_versions_name, name_length),
-        Arc::clone(&cancelled),
     )?;
 
-    configure_base_env(config, &mut base_runner);
-    configure_msrv_env(&msrv_dir, &mut msrv_runner);
-    configure_min_versions_env(&min_versions_dir, &mut min_versions_runner);
+    configure_base_env(&mut base_runner);
+    configure_msrv_env(&mut msrv_runner);
+    configure_min_versions_env(&mut min_versions_runner);
 
     // Update lockfiles and pre-fetch/unpack all crates sequentially before launching
     // the parallel tracks so they don't contend on Cargo's global package cache lock.
@@ -144,15 +150,13 @@ fn create_progress(multi_progress: &MultiProgress, name: &str, name_length: usiz
     pb
 }
 
-fn run_setup_phase(config: &Config, pb: ProgressBar, cancelled: Arc<AtomicBool>) -> Result<()> {
-    let runner = TrackRunner::new(
-        "setup",
-        "Setup",
-        &config.base_dir,
-        &config.base_dir,
-        pb,
-        cancelled,
-    )?;
+fn run_setup_phase(
+    config: &Config,
+    base_workspace: Workspace,
+    pb: ProgressBar,
+    shared: Arc<Shared>,
+) -> Result<()> {
+    let runner = TrackRunner::new("setup", "Setup", shared, base_workspace, pb)?;
 
     runner.run_rustup(&["update"])?;
     runner.run_rustup(&["install", "stable"])?;
@@ -182,22 +186,18 @@ fn run_setup_phase(config: &Config, pb: ProgressBar, cancelled: Arc<AtomicBool>)
     Ok(())
 }
 
-fn configure_base_env(config: &Config, runner: &mut TrackRunner) {
-    let target_dir = config.base_dir.join("target");
-    runner.set_env("CARGO_TARGET_DIR", &target_dir);
+fn configure_base_env(runner: &mut TrackRunner) {
     runner.set_env("CARGO_BUILD_WARNINGS", "deny");
     runner.set_env("RUSTDOCFLAGS", "-D warnings");
     runner.remove_env("RUSTFLAGS");
 }
 
-fn configure_msrv_env(msrv_dir: &IsolatedDir, runner: &mut TrackRunner) {
-    runner.set_env("CARGO_TARGET_DIR", &msrv_dir.cargo_target_dir);
-    runner.set_env("RUSTFLAGS", "-D warnings");
+fn configure_msrv_env(runner: &mut TrackRunner) {
+    runner.set_env("RUSTFLAGS", "-D warnings"); // MSRV does not have CARGO_BUILD_WARNINGS yet
     runner.remove_env("CARGO_BUILD_WARNINGS");
 }
 
-fn configure_min_versions_env(min_versions_dir: &IsolatedDir, runner: &mut TrackRunner) {
-    runner.set_env("CARGO_TARGET_DIR", &min_versions_dir.cargo_target_dir);
+fn configure_min_versions_env(runner: &mut TrackRunner) {
     runner.set_env("CARGO_BUILD_WARNINGS", "deny");
     runner.set_env("RUSTDOCFLAGS", "-D warnings");
     runner.remove_env("RUSTFLAGS");

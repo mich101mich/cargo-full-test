@@ -8,12 +8,12 @@
     unused_qualifications
 )]
 
-//! `cargo-full-test` — Parallel full test, lint, coverage, MSRV, and minimal-versions runner.
+//! `cargo full-test` - Parallel full test, lint, coverage, MSRV, and minimal-versions runner.
 
 mod config;
 mod pipeline;
 mod runner;
-mod test_dir;
+mod workspace;
 
 use std::ffi::OsString;
 use std::path::PathBuf;

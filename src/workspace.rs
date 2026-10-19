@@ -2,45 +2,54 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-/// Represents an isolated test directory inside `<base_dir>/target/<out_dir_name>`
-/// containing native OS symlinks to top-level workspace items (except `target` and `Cargo.lock`).
 #[derive(Debug, Clone)]
-pub struct IsolatedDir {
-    /// Working directory for Cargo commands (`<base_dir>/target/<out_dir_name>`).
+pub struct Workspace {
+    /// Working directory for Cargo commands.
     pub work_dir: PathBuf,
-    /// Isolated target directory (`<base_dir>/target/<out_dir_name>/target`).
+    /// Target directory for Cargo commands.
     pub cargo_target_dir: PathBuf,
 }
 
-/// Prepares an isolated test directory in `<base_dir>/target/<out_dir_name>` by symlinking
-/// all top-level entries from `base_dir` except `target` and `Cargo.lock`.
-pub fn prepare_isolated_test_dir(base_dir: &Path, out_dir_name: &str) -> Result<IsolatedDir> {
-    let target_dir = base_dir.join("target").join(out_dir_name);
-    fs_err::create_dir_all(&target_dir)?;
-
-    for entry in fs_err::read_dir(base_dir)? {
-        let entry = entry?;
-        let file_name = entry.file_name();
-        if file_name == "target" || file_name == "Cargo.lock" || file_name == ".git" {
-            continue;
+impl Workspace {
+    /// Creates a new `Workspace` representing the base directory.
+    pub fn new_base_dir(base_dir: &Path) -> Self {
+        let cargo_target_dir = base_dir.join("target");
+        Self {
+            work_dir: base_dir.to_path_buf(),
+            cargo_target_dir,
         }
-
-        let src_path = entry.path();
-        let dst = target_dir.join(&file_name);
-
-        if fs_err::read_link(&dst).is_ok_and(|existing_target| existing_target == src_path) {
-            continue;
-        }
-
-        remove_existing_entry(&dst)?;
-        create_symlink(&src_path, &dst)?;
     }
 
-    let cargo_target_dir = target_dir.join("target");
-    Ok(IsolatedDir {
-        work_dir: target_dir,
-        cargo_target_dir,
-    })
+    /// Prepares an isolated test directory in `<base_dir>/target/<out_dir_name>` by symlinking
+    /// all top-level entries from `base_dir` except `target` and `Cargo.lock`.
+    pub fn new_isolated(base_dir: &Path, out_dir_name: &str) -> Result<Self> {
+        let work_dir = base_dir.join("target").join(out_dir_name);
+        fs_err::create_dir_all(&work_dir)?;
+
+        for entry in fs_err::read_dir(base_dir)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            if file_name == "target" || file_name == "Cargo.lock" || file_name == ".git" {
+                continue;
+            }
+
+            let src_path = entry.path();
+            let dst = work_dir.join(&file_name);
+
+            if fs_err::read_link(&dst).is_ok_and(|existing_target| existing_target == src_path) {
+                continue;
+            }
+
+            remove_existing_entry(&dst)?;
+            create_symlink(&src_path, &dst)?;
+        }
+
+        let cargo_target_dir = work_dir.join("target");
+        Ok(Workspace {
+            work_dir,
+            cargo_target_dir,
+        })
+    }
 }
 
 fn remove_existing_entry(dst: &Path) -> Result<()> {
