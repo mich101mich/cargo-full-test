@@ -3,10 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 
 /// Execution context for a single track (e.g. `Setup`, `Base`, `MSRV`, `MinVersions`).
 #[derive(Debug)]
@@ -36,20 +35,12 @@ impl TrackRunner {
         display_name: &str,
         base_dir: &Path,
         work_dir: &Path,
-        multi_progress: &MultiProgress,
+        pb: ProgressBar,
         cancelled: Arc<AtomicBool>,
     ) -> Result<Self> {
         let target_dir = base_dir.join("target");
         fs_err::create_dir_all(&target_dir)?;
         let log_path = target_dir.join(format!("test_{track_id}.log"));
-
-        let style = ProgressStyle::with_template("{spinner:.cyan} [{prefix:.bold}] {wide_msg}")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner());
-
-        let pb = multi_progress.add(ProgressBar::new_spinner());
-        pb.set_style(style);
-        pb.set_prefix(display_name.to_owned());
-        pb.enable_steady_tick(Duration::from_millis(100));
 
         Ok(Self {
             display_name: display_name.to_owned(),

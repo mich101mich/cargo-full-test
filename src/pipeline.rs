@@ -1,10 +1,13 @@
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
+use std::{
+    process::{Command, Stdio},
+    time::Duration,
+};
 
 use anyhow::{Result, bail};
-use indicatif::MultiProgress;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use crate::config::Config;
 use crate::runner::TrackRunner;
@@ -28,35 +31,48 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
     let cancelled = Arc::new(AtomicBool::new(false));
 
     // Phase 1: Pre-flight & Setup (Sequential)
-    run_setup_phase(config, &multi_progress, Arc::clone(&cancelled))?;
+    run_setup_phase(
+        config,
+        create_progress(&multi_progress, "Setup", 5),
+        Arc::clone(&cancelled),
+    )?;
 
     let msrv_dir_name = format!("msrv_{}", config.msrv);
     let msrv_dir = prepare_isolated_test_dir(&config.base_dir, &msrv_dir_name)?;
     let min_versions_dir = prepare_isolated_test_dir(&config.base_dir, "min_versions")?;
 
+    let base_name = "Base";
+    let msrv_name = &format!("MSRV ({})", config.msrv);
+    let min_versions_name = "MinVersions";
+
+    let name_length = base_name
+        .len()
+        .max(msrv_name.len())
+        .max(min_versions_name.len());
+
     // Phase 2: Parallel Test Tracks
     let base_runner = TrackRunner::new(
         "base",
-        "Base",
+        base_name,
         &config.base_dir,
         &config.base_dir,
-        &multi_progress,
+        create_progress(&multi_progress, base_name, name_length),
         Arc::clone(&cancelled),
     )?;
     let msrv_runner = TrackRunner::new(
         "msrv",
-        &format!("MSRV ({})", config.msrv),
+        msrv_name,
         &config.base_dir,
         &msrv_dir.work_dir,
-        &multi_progress,
+        create_progress(&multi_progress, msrv_name, name_length),
         Arc::clone(&cancelled),
     )?;
     let min_versions_runner = TrackRunner::new(
         "min_versions",
-        "MinVersions",
+        min_versions_name,
         &config.base_dir,
         &min_versions_dir.work_dir,
-        &multi_progress,
+        create_progress(&multi_progress, min_versions_name, name_length),
         Arc::clone(&cancelled),
     )?;
 
@@ -105,17 +121,24 @@ fn verify_required_executables() -> Result<()> {
     Ok(())
 }
 
-fn run_setup_phase(
-    config: &Config,
-    multi_progress: &MultiProgress,
-    cancelled: Arc<AtomicBool>,
-) -> Result<()> {
+fn create_progress(multi_progress: &MultiProgress, name: &str, name_length: usize) -> ProgressBar {
+    let style = ProgressStyle::with_template("{spinner:.cyan} [{prefix:.bold}] {wide_msg}")
+        .unwrap_or_else(|_| ProgressStyle::default_spinner());
+
+    let pb = multi_progress.add(ProgressBar::new_spinner());
+    pb.set_style(style);
+    pb.set_prefix(format!("{:width$}", name, width = name_length));
+    pb.enable_steady_tick(Duration::from_millis(100));
+    pb
+}
+
+fn run_setup_phase(config: &Config, pb: ProgressBar, cancelled: Arc<AtomicBool>) -> Result<()> {
     let runner = TrackRunner::new(
         "setup",
         "Setup",
         &config.base_dir,
         &config.base_dir,
-        multi_progress,
+        pb,
         cancelled,
     )?;
 
