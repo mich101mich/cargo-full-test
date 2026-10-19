@@ -121,6 +121,7 @@ impl TrackRunner {
         cmd.args(args)
             .current_dir(&self.work_dir)
             .env("CARGO_TERM_COLOR", "always")
+            .env("CARGO_CACHE_AUTO_CLEAN_FREQUENCY", "never") // avoid package lock from GC
             .stdout(Stdio::from(writer))
             .stderr(Stdio::from(writer_err));
 
@@ -156,7 +157,7 @@ impl TrackRunner {
 
             let stripped = strip_ansi_codes(&line_lossy);
             let trimmed = stripped.trim();
-            if !trimmed.is_empty() {
+            if !trimmed.is_empty() && !trimmed.starts_with("Blocking waiting for file lock") {
                 self.pb
                     .set_message(format!("Running {cmd_str} > {trimmed}"));
             }

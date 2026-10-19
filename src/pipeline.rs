@@ -51,7 +51,7 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
         .max(min_versions_name.len());
 
     // Phase 2: Parallel Test Tracks
-    let base_runner = TrackRunner::new(
+    let mut base_runner = TrackRunner::new(
         "base",
         base_name,
         &config.base_dir,
@@ -59,7 +59,7 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
         create_progress(&multi_progress, base_name, name_length),
         Arc::clone(&cancelled),
     )?;
-    let msrv_runner = TrackRunner::new(
+    let mut msrv_runner = TrackRunner::new(
         "msrv",
         msrv_name,
         &config.base_dir,
@@ -67,7 +67,7 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
         create_progress(&multi_progress, msrv_name, name_length),
         Arc::clone(&cancelled),
     )?;
-    let min_versions_runner = TrackRunner::new(
+    let mut min_versions_runner = TrackRunner::new(
         "min_versions",
         min_versions_name,
         &config.base_dir,
@@ -76,11 +76,20 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
         Arc::clone(&cancelled),
     )?;
 
+    configure_base_env(config, &mut base_runner);
+    configure_msrv_env(&msrv_dir, &mut msrv_runner);
+    configure_min_versions_env(&min_versions_dir, &mut min_versions_runner);
+
+    // Update lockfiles and pre-fetch/unpack all crates sequentially before launching
+    // the parallel tracks so they don't contend on Cargo's global package cache lock.
+    prepare_base_deps(&mut base_runner)?;
+    prepare_msrv_deps(config, &mut msrv_runner)?;
+    prepare_min_versions_deps(&mut min_versions_runner)?;
+
     let (base_res, msrv_res, min_res) = std::thread::scope(|s| {
         let base_handle = s.spawn(|| run_base_track(config, base_runner));
-        let msrv_handle = s.spawn(|| run_msrv_track(config, &msrv_dir, msrv_runner));
-        let min_handle =
-            s.spawn(|| run_min_versions_track(config, &min_versions_dir, min_versions_runner));
+        let msrv_handle = s.spawn(|| run_msrv_track(config, msrv_runner));
+        let min_handle = s.spawn(|| run_min_versions_track(min_versions_runner));
 
         let r1 = base_handle
             .join()
@@ -176,14 +185,71 @@ fn run_setup_phase(config: &Config, pb: ProgressBar, cancelled: Arc<AtomicBool>)
     Ok(())
 }
 
-fn run_base_track(config: &Config, mut runner: TrackRunner) -> Result<()> {
+fn configure_base_env(config: &Config, runner: &mut TrackRunner) {
     let target_dir = config.base_dir.join("target");
     runner.set_env("CARGO_TARGET_DIR", target_dir.to_string_lossy());
     runner.set_env("CARGO_BUILD_WARNINGS", "deny");
     runner.set_env("RUSTDOCFLAGS", "-D warnings");
     runner.remove_env("RUSTFLAGS");
+}
 
+fn configure_msrv_env(msrv_dir: &IsolatedDir, runner: &mut TrackRunner) {
+    runner.set_env(
+        "CARGO_TARGET_DIR",
+        msrv_dir.cargo_target_dir.to_string_lossy(),
+    );
+    runner.set_env("RUSTFLAGS", "-D warnings");
+    runner.remove_env("CARGO_BUILD_WARNINGS");
+}
+
+fn configure_min_versions_env(min_versions_dir: &IsolatedDir, runner: &mut TrackRunner) {
+    runner.set_env(
+        "CARGO_TARGET_DIR",
+        min_versions_dir.cargo_target_dir.to_string_lossy(),
+    );
+    runner.set_env("CARGO_BUILD_WARNINGS", "deny");
+    runner.set_env("RUSTDOCFLAGS", "-D warnings");
+    runner.remove_env("RUSTFLAGS");
+}
+
+fn prepare_base_deps(runner: &mut TrackRunner) -> Result<()> {
     runner.run_cmd("cargo", &["update"])?;
+    runner.run_cmd("cargo", &["+stable", "fetch"])?;
+    runner.set_env("CARGO_NET_OFFLINE", "true");
+    Ok(())
+}
+
+fn prepare_msrv_deps(config: &Config, runner: &mut TrackRunner) -> Result<()> {
+    let plus_msrv = format!("+{}", config.msrv);
+    runner.run_cmd("cargo", &[&plus_msrv, "update"])?;
+
+    for ovr in &config.msrv_overrides {
+        runner.run_cmd(
+            "cargo",
+            &[
+                &plus_msrv,
+                "update",
+                "-p",
+                &ovr.package,
+                "--precise",
+                &ovr.version,
+            ],
+        )?;
+    }
+
+    runner.run_cmd("cargo", &[&plus_msrv, "fetch"])?;
+    runner.set_env("CARGO_NET_OFFLINE", "true");
+    Ok(())
+}
+
+fn prepare_min_versions_deps(runner: &mut TrackRunner) -> Result<()> {
+    runner.run_cmd("cargo", &["+nightly", "-Z", "minimal-versions", "update"])?;
+    runner.run_cmd("cargo", &["+stable", "fetch"])?;
+    runner.set_env("CARGO_NET_OFFLINE", "true");
+    Ok(())
+}
+
+fn run_base_track(config: &Config, mut runner: TrackRunner) -> Result<()> {
     runner.run_cmd("cargo", &["+stable", "test", "--workspace"])?;
     runner.run_coverage("nightly", "nightly", &["--workspace"])?;
     runner.run_cmd("cargo", &["+nightly", "doc", "--no-deps", "--workspace"])?;
@@ -213,51 +279,15 @@ fn run_base_track(config: &Config, mut runner: TrackRunner) -> Result<()> {
     Ok(())
 }
 
-fn run_msrv_track(config: &Config, msrv_dir: &IsolatedDir, mut runner: TrackRunner) -> Result<()> {
-    runner.set_env(
-        "CARGO_TARGET_DIR",
-        msrv_dir.cargo_target_dir.to_string_lossy(),
-    );
-    runner.set_env("RUSTFLAGS", "-D warnings");
-    runner.remove_env("CARGO_BUILD_WARNINGS");
-
+fn run_msrv_track(config: &Config, runner: TrackRunner) -> Result<()> {
     let plus_msrv = format!("+{}", config.msrv);
-    runner.run_cmd("cargo", &[&plus_msrv, "update"])?;
-
-    for ovr in &config.msrv_overrides {
-        runner.run_cmd(
-            "cargo",
-            &[
-                &plus_msrv,
-                "update",
-                "-p",
-                &ovr.package,
-                "--precise",
-                &ovr.version,
-            ],
-        )?;
-    }
-
     runner.run_cmd("cargo", &[&plus_msrv, "test", "--workspace"])?;
 
     runner.finish("Passed");
     Ok(())
 }
 
-fn run_min_versions_track(
-    _config: &Config,
-    min_versions_dir: &IsolatedDir,
-    mut runner: TrackRunner,
-) -> Result<()> {
-    runner.set_env(
-        "CARGO_TARGET_DIR",
-        min_versions_dir.cargo_target_dir.to_string_lossy(),
-    );
-    runner.set_env("CARGO_BUILD_WARNINGS", "deny");
-    runner.set_env("RUSTDOCFLAGS", "-D warnings");
-    runner.remove_env("RUSTFLAGS");
-
-    runner.run_cmd("cargo", &["+nightly", "-Z", "minimal-versions", "update"])?;
+fn run_min_versions_track(runner: TrackRunner) -> Result<()> {
     runner.run_cmd("cargo", &["+stable", "test", "--workspace"])?;
     runner.run_cmd("cargo", &["+nightly", "test", "--workspace"])?;
 
