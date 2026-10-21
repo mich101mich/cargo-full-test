@@ -1,9 +1,10 @@
-use std::ffi::OsString;
-use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    ffi::OsString,
+    io::{BufRead, BufReader, Write},
+    path::PathBuf,
+    process::{Command, Stdio},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail};
 use indicatif::ProgressBar;
@@ -37,8 +38,6 @@ pub struct Shared {
     pub log_dir: PathBuf,
     /// Directory for storing coverage output.
     pub cov_base_dir: PathBuf,
-    /// Shared cancellation flag across tracks.
-    pub cancelled: AtomicBool,
 }
 
 /// Execution context for a single track (e.g. `Setup`, `Base`, `MSRV`, `MinVersions`).
@@ -107,17 +106,16 @@ impl TrackRunner {
     /// Runs a command in this track's working directory, logging raw output to `self.log_path`
     /// and updating the live spinner with the most recent output line.
     pub fn run_cmd(&self, program: &str, args: &[&str]) -> Result<()> {
-        if self.shared.cancelled.load(Ordering::Relaxed) {
-            bail!(
-                "[{}] Cancelled due to failure in another track",
-                self.display_name
-            );
-        }
-
         let cmd_str = if args.is_empty() {
             program.to_owned()
         } else {
             format!("{program} {}", args.join(" "))
+        };
+
+        let short_cmd_str = if cmd_str.len() > 40 {
+            format!("{}..", &cmd_str[..38])
+        } else {
+            cmd_str.clone()
         };
 
         self.pb.set_message(format!("Running {cmd_str}"));
@@ -181,7 +179,7 @@ impl TrackRunner {
             let trimmed = stripped.trim();
             if !trimmed.is_empty() && !trimmed.starts_with("Blocking waiting for file lock") {
                 self.pb
-                    .set_message(format!("Running {cmd_str} > {trimmed}"));
+                    .set_message(format!("Running {short_cmd_str} > {trimmed}"));
             }
         }
 
@@ -190,7 +188,6 @@ impl TrackRunner {
             .with_context(|| format!("Failed waiting for `{cmd_str}`"))?;
 
         if !status.success() {
-            self.shared.cancelled.store(true, Ordering::Relaxed);
             self.pb.finish_and_clear();
             let mut stderr = std::io::stderr().lock();
             let _ = writeln!(

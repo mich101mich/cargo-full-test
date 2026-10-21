@@ -1,21 +1,21 @@
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::time::Instant;
 use std::{
     process::{Command, Stdio},
-    time::Duration,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Result, bail};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
-use crate::config::Config;
-use crate::runner::{
-    Shared,
-    Toolchain::{Nightly, Stable},
-    TrackRunner,
+use crate::{
+    config::Config,
+    runner::{
+        Shared,
+        Toolchain::{Nightly, Stable},
+        TrackRunner,
+    },
+    workspace::Workspace,
 };
-use crate::workspace::Workspace;
 
 /// Runs the full test pipeline (Setup -> Parallel Base / MSRV / Minimal-Versions -> Summary).
 pub fn run_pipeline(config: &Config) -> Result<()> {
@@ -36,7 +36,6 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
     let shared = Arc::new(Shared {
         log_dir: config.base_dir.join("target").join("log"),
         cov_base_dir: cov_base,
-        cancelled: AtomicBool::new(false),
     });
 
     let base_workspace = Workspace::new_base_dir(&config.base_dir);
