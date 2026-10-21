@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     ffi::OsString,
     io::{BufRead, BufReader, Write},
     path::PathBuf,
@@ -7,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use indicatif::ProgressBar;
+use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::workspace::Workspace;
 
@@ -38,13 +39,15 @@ pub struct Shared {
     pub log_dir: PathBuf,
     /// Directory for storing coverage output.
     pub cov_base_dir: PathBuf,
+    /// Multi-progress indicator for displaying live progress bars.
+    pub multi_progress: indicatif::MultiProgress,
 }
 
 /// Execution context for a single track (e.g. `Setup`, `Base`, `MSRV`, `MinVersions`).
 #[derive(Debug)]
 pub struct TrackRunner {
     /// Display name for the track (e.g., `"Base"`).
-    pub display_name: String,
+    pub display_name: Cow<'static, str>,
     /// Directories associated with this track.
     pub workspace: Workspace,
     /// Shared information.
@@ -53,8 +56,6 @@ pub struct TrackRunner {
     pub log_path: PathBuf,
     /// Environment variables to set on every command in this track.
     pub env_set: Vec<(String, OsString)>,
-    /// Environment variables to remove on every command in this track.
-    pub env_remove: Vec<String>,
     /// Live progress bar for this track.
     pub pb: ProgressBar,
 }
@@ -63,13 +64,15 @@ impl TrackRunner {
     /// Creates a new [`TrackRunner`] attached to `multi_progress`.
     pub fn new(
         track_id: &str,
-        display_name: &str,
+        display_name: impl Into<Cow<'static, str>>,
         shared: Arc<Shared>,
         workspace: Workspace,
-        pb: ProgressBar,
     ) -> Result<Self> {
         fs_err::create_dir_all(&shared.log_dir)?;
         let log_path = shared.log_dir.join(format!("test_{track_id}.log"));
+        let display_name = display_name.into();
+
+        let pb = Self::create_progress_bar(display_name.clone(), &shared.multi_progress);
 
         let env_set = vec![(
             "CARGO_TARGET_DIR".into(),
@@ -77,14 +80,26 @@ impl TrackRunner {
         )];
 
         Ok(Self {
-            display_name: display_name.to_owned(),
+            display_name,
             workspace,
             shared,
             log_path,
             env_set,
-            env_remove: Vec::new(),
             pb,
         })
+    }
+
+    fn create_progress_bar(
+        display_name: Cow<'static, str>,
+        multi_progress: &indicatif::MultiProgress,
+    ) -> ProgressBar {
+        let style = ProgressStyle::with_template("{spinner:.cyan} [{prefix:.bold}] {wide_msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner());
+        let pb = multi_progress.add(ProgressBar::new_spinner());
+        pb.set_style(style);
+        pb.set_prefix(display_name);
+        pb.enable_steady_tick(std::time::Duration::from_millis(100));
+        pb
     }
 
     /// Sets an environment variable for commands in this track.
@@ -96,11 +111,6 @@ impl TrackRunner {
         } else {
             self.env_set.push((key, val));
         }
-    }
-
-    /// Removes an environment variable for commands in this track.
-    pub fn remove_env(&mut self, key: impl Into<String>) {
-        self.env_remove.push(key.into());
     }
 
     /// Runs a command in this track's working directory, logging raw output to `self.log_path`
@@ -145,9 +155,6 @@ impl TrackRunner {
             .stdout(Stdio::from(writer))
             .stderr(Stdio::from(writer_err));
 
-        for key in &self.env_remove {
-            cmd.env_remove(key);
-        }
         for (key, val) in &self.env_set {
             cmd.env(key, val);
         }
@@ -226,7 +233,9 @@ impl TrackRunner {
     ) -> Result<()> {
         fs_err::create_dir_all(&self.shared.cov_base_dir)?;
 
-        let output_path = self.shared.cov_base_dir.join(cov_name).join("lcov.info");
+        let output_parent = self.shared.cov_base_dir.join(cov_name);
+        fs_err::create_dir_all(&output_parent)?;
+        let output_path = output_parent.join("lcov.info");
         let output_path = output_path.to_string_lossy();
 
         let mut args = vec![

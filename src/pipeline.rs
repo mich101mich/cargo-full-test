@@ -1,11 +1,10 @@
 use std::{
     process::{Command, Stdio},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use anyhow::{Result, bail};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use crate::{
     config::Config,
@@ -23,97 +22,70 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
 
     verify_required_executables()?;
 
-    // Ensure coverage directories exist
-    let cov_base = config.base_dir.join("target").join("cov");
-    fs_err::create_dir_all(cov_base.join("nightly"))?;
-    if config.run_error_message_tests {
-        fs_err::create_dir_all(cov_base.join("err_stable"))?;
-        fs_err::create_dir_all(cov_base.join("err_nightly"))?;
-    }
-
-    let multi_progress = MultiProgress::new();
+    // Ensure directories exist
+    let log_dir = config.base_dir.join("target").join("log");
+    let cov_base_dir = config.base_dir.join("target").join("cov");
+    fs_err::create_dir_all(&log_dir)?;
+    fs_err::create_dir_all(&cov_base_dir)?;
 
     let shared = Arc::new(Shared {
-        log_dir: config.base_dir.join("target").join("log"),
-        cov_base_dir: cov_base,
+        log_dir,
+        cov_base_dir,
+        multi_progress: indicatif::MultiProgress::new(),
     });
 
     let base_workspace = Workspace::new_base_dir(&config.base_dir);
 
     // Phase 1: Pre-flight & Setup (Sequential)
-    run_setup_phase(
-        config,
-        base_workspace.clone(),
-        create_progress(&multi_progress, "Setup", 5),
-        Arc::clone(&shared),
-    )?;
+    run_setup_phase(config, base_workspace.clone(), Arc::clone(&shared))?;
 
     let msrv_dir_name = format!("msrv_{}", config.msrv);
+
+    // clean up any different MSRV workspaces
+    if let Ok(entries) = fs_err::read_dir(config.base_dir.join("target")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir()
+                && let Some(filename) = path.file_name()
+                && filename.to_string_lossy().starts_with("msrv_")
+                && filename != msrv_dir_name.as_str()
+            {
+                let _ = fs_err::remove_dir_all(path);
+            }
+        }
+    }
+
     let msrv_workspace = Workspace::new_isolated(&config.base_dir, &msrv_dir_name)?;
     let min_versions_workspace = Workspace::new_isolated(&config.base_dir, "min_versions")?;
 
-    let base_name = "Base";
-    let msrv_name = &format!("MSRV ({})", config.msrv);
-    let min_versions_name = "MinVersions";
-
-    let name_length = base_name
-        .len()
-        .max(msrv_name.len())
-        .max(min_versions_name.len());
-
     // Phase 2: Parallel Test Tracks
-    let mut base_runner = TrackRunner::new(
-        "base",
-        base_name,
-        Arc::clone(&shared),
-        base_workspace,
-        create_progress(&multi_progress, base_name, name_length),
-    )?;
+    let mut base_runner = TrackRunner::new("base", "Base", Arc::clone(&shared), base_workspace)?;
+    configure_base_env(&mut base_runner);
+    prepare_base_deps(&mut base_runner)?;
+
     let mut msrv_runner = TrackRunner::new(
         "msrv",
-        msrv_name,
+        format!("MSRV ({})", config.msrv),
         Arc::clone(&shared),
         msrv_workspace,
-        create_progress(&multi_progress, msrv_name, name_length),
     )?;
+    configure_msrv_env(&mut msrv_runner);
+    prepare_msrv_deps(config, &mut msrv_runner)?;
+
     let mut min_versions_runner = TrackRunner::new(
         "min_versions",
-        min_versions_name,
+        "MinVersions",
         Arc::clone(&shared),
         min_versions_workspace,
-        create_progress(&multi_progress, min_versions_name, name_length),
     )?;
-
-    configure_base_env(&mut base_runner);
-    configure_msrv_env(&mut msrv_runner);
     configure_min_versions_env(&mut min_versions_runner);
-
-    // Update lockfiles and pre-fetch/unpack all crates sequentially before launching
-    // the parallel tracks so they don't contend on Cargo's global package cache lock.
-    prepare_base_deps(&mut base_runner)?;
-    prepare_msrv_deps(config, &mut msrv_runner)?;
     prepare_min_versions_deps(&mut min_versions_runner)?;
 
-    let (base_res, msrv_res, min_res) = std::thread::scope(|s| {
-        let base_handle = s.spawn(|| run_base_track(config, base_runner));
-        let msrv_handle = s.spawn(|| run_msrv_track(config, msrv_runner));
-        let min_handle = s.spawn(|| run_min_versions_track(min_versions_runner));
-
-        let r1 = base_handle
-            .join()
-            .unwrap_or_else(|_| bail!("Base track thread panicked"));
-        let r2 = msrv_handle
-            .join()
-            .unwrap_or_else(|_| bail!("MSRV track thread panicked"));
-        let r3 = min_handle
-            .join()
-            .unwrap_or_else(|_| bail!("Minimal-Versions track thread panicked"));
-        (r1, r2, r3)
+    std::thread::scope(|s| {
+        s.spawn(|| run_base_track(config, base_runner));
+        s.spawn(|| run_msrv_track(config, msrv_runner));
+        s.spawn(|| run_min_versions_track(min_versions_runner));
     });
-
-    base_res?;
-    msrv_res?;
-    min_res?;
 
     // Phase 3: Completion Summary
     let elapsed = start_time.elapsed().as_secs();
@@ -138,24 +110,8 @@ fn verify_required_executables() -> Result<()> {
     Ok(())
 }
 
-fn create_progress(multi_progress: &MultiProgress, name: &str, name_length: usize) -> ProgressBar {
-    let style = ProgressStyle::with_template("{spinner:.cyan} [{prefix:.bold}] {wide_msg}")
-        .unwrap_or_else(|_| ProgressStyle::default_spinner());
-
-    let pb = multi_progress.add(ProgressBar::new_spinner());
-    pb.set_style(style);
-    pb.set_prefix(format!("{:width$}", name, width = name_length));
-    pb.enable_steady_tick(Duration::from_millis(100));
-    pb
-}
-
-fn run_setup_phase(
-    config: &Config,
-    base_workspace: Workspace,
-    pb: ProgressBar,
-    shared: Arc<Shared>,
-) -> Result<()> {
-    let runner = TrackRunner::new("setup", "Setup", shared, base_workspace, pb)?;
+fn run_setup_phase(config: &Config, base_workspace: Workspace, shared: Arc<Shared>) -> Result<()> {
+    let runner = TrackRunner::new("setup", "Setup", shared, base_workspace)?;
 
     runner.run_rustup(&["update"])?;
     runner.run_rustup(&["install", "stable"])?;
@@ -188,20 +144,18 @@ fn run_setup_phase(
 fn configure_base_env(runner: &mut TrackRunner) {
     runner.set_env("CARGO_BUILD_WARNINGS", "deny");
     runner.set_env("RUSTDOCFLAGS", "-D warnings");
-    runner.remove_env("RUSTFLAGS");
 }
 
 fn configure_msrv_env(runner: &mut TrackRunner) {
     runner.set_env("RUSTFLAGS", "-D warnings"); // MSRV does not have CARGO_BUILD_WARNINGS yet
-    runner.remove_env("CARGO_BUILD_WARNINGS");
 }
 
 fn configure_min_versions_env(runner: &mut TrackRunner) {
     runner.set_env("CARGO_BUILD_WARNINGS", "deny");
-    runner.set_env("RUSTDOCFLAGS", "-D warnings");
-    runner.remove_env("RUSTFLAGS");
 }
 
+// Update lockfiles and pre-fetch/unpack all crates sequentially before launching
+// the parallel tracks so they don't contend on Cargo's global package cache lock.
 fn prepare_base_deps(runner: &mut TrackRunner) -> Result<()> {
     runner.run_cargo(Stable, &["update"])?;
     runner.run_cargo(Stable, &["fetch"])?;
