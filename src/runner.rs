@@ -4,43 +4,31 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::PathBuf,
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::workspace::Workspace;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Toolchain {
-    Stable,
-    Nightly,
-    Specific(String),
-}
-impl<'a> From<&'a String> for Toolchain {
-    fn from(raw: &'a String) -> Self {
-        Self::Specific(raw.to_owned())
-    }
-}
-impl std::fmt::Display for Toolchain {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Toolchain::Stable => write!(f, "+stable"),
-            Toolchain::Nightly => write!(f, "+nightly"),
-            Toolchain::Specific(version) => write!(f, "+{version}"),
-        }
-    }
-}
+use crate::{
+    args::{Args, Instruction},
+    workspace::Workspace,
+};
 
 #[derive(Debug)]
 pub struct Shared {
+    /// Base directory of the project.
+    pub base_dir: PathBuf,
     /// Directory for storing log files.
     pub log_dir: PathBuf,
     /// Directory for storing coverage output.
     pub cov_base_dir: PathBuf,
     /// Multi-progress indicator for displaying live progress bars.
     pub multi_progress: indicatif::MultiProgress,
+    /// Mutex for synchronizing fetch operations.
+    ///
+    /// Cargo locks the package registry in a way that deadlocks between MSRV and current cargo.
+    pub fetch_mutex: Mutex<()>,
 }
 
 /// Execution context for a single track (e.g. `Setup`, `Base`, `MSRV`, `MinVersions`).
@@ -58,6 +46,10 @@ pub struct TrackRunner {
     pub env_set: Vec<(String, OsString)>,
     /// Live progress bar for this track.
     pub pb: ProgressBar,
+    /// Commands that were executed in this track.
+    pub commands: Vec<String>,
+    /// Output of a failed command, if any.
+    pub failed_output: Option<String>,
 }
 
 impl TrackRunner {
@@ -86,6 +78,8 @@ impl TrackRunner {
             log_path,
             env_set,
             pb,
+            commands: Vec::new(),
+            failed_output: None,
         })
     }
 
@@ -93,9 +87,11 @@ impl TrackRunner {
         display_name: Cow<'static, str>,
         multi_progress: &indicatif::MultiProgress,
     ) -> ProgressBar {
-        let style = ProgressStyle::with_template("{spinner:.cyan} [{prefix:.bold}] {wide_msg}")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner());
-        let pb = multi_progress.add(ProgressBar::new_spinner());
+        let style = ProgressStyle::with_template(
+            "[{prefix:12.bold}] {bar:10.cyan/blue} {pos}/{len} {wide_msg}",
+        )
+        .unwrap();
+        let pb = multi_progress.add(ProgressBar::new(0));
         pb.set_style(style);
         pb.set_prefix(display_name);
         pb.enable_steady_tick(std::time::Duration::from_millis(100));
@@ -115,12 +111,11 @@ impl TrackRunner {
 
     /// Runs a command in this track's working directory, logging raw output to `self.log_path`
     /// and updating the live spinner with the most recent output line.
-    pub fn run_cmd(&self, program: &str, args: &[&str]) -> Result<()> {
-        let cmd_str = if args.is_empty() {
-            program.to_owned()
-        } else {
-            format!("{program} {}", args.join(" "))
-        };
+    pub fn run_cmd(&mut self, program: &str, args: Args) -> Result<bool> {
+        let mut cmd_str = program.to_owned();
+        args.write_to(&mut cmd_str, &self.shared.base_dir);
+
+        self.commands.push(cmd_str.clone());
 
         let short_cmd_str = if cmd_str.len() > 40 {
             format!("{}..", &cmd_str[..38])
@@ -195,64 +190,86 @@ impl TrackRunner {
             .with_context(|| format!("Failed waiting for `{cmd_str}`"))?;
 
         if !status.success() {
-            self.pb.finish_and_clear();
-            let mut stderr = std::io::stderr().lock();
-            let _ = writeln!(
-                stderr,
-                "\n=== [{}] Command failed: `{cmd_str}` ===",
-                self.display_name
-            );
-            let _ = write!(stderr, "{raw_output}");
-            let _ = stderr.flush();
-            bail!(
-                "[{}] Command `{cmd_str}` failed with status {status}",
-                self.display_name
-            );
+            self.failed_output = Some(format!(
+                r#"        Failed with status {status}
+========== output ==========
+{raw_output}
+============================
+"#
+            ));
+            return Ok(false);
         }
 
-        Ok(())
+        Ok(true)
     }
 
-    pub fn run_cargo(&self, toolchain: impl Into<Toolchain>, args: &[&str]) -> Result<()> {
-        let plus_toolchain = toolchain.into().to_string();
-        let mut cmd_args = vec![plus_toolchain.as_str()];
-        cmd_args.extend_from_slice(args);
-        self.run_cmd("cargo", &cmd_args)
+    pub fn print_summary(self) {
+        self.pb.finish_and_clear();
+
+        self.pb.suspend(|| {
+            let outcome = if self.failed_output.is_some() {
+                "failed"
+            } else {
+                "success"
+            };
+            println!(
+                "[{:12}] ({outcome})",
+                console::style(&self.display_name).bold()
+            );
+
+            for cmd in &self.commands {
+                println!("    {}", cmd);
+            }
+            if let Some(failed_output) = &self.failed_output {
+                println!("{failed_output}");
+            }
+        });
     }
 
-    pub fn run_rustup(&self, args: &[&str]) -> Result<()> {
-        self.run_cmd("rustup", args)
-    }
+    pub(crate) fn run_instructions(
+        mut self,
+        instructions: impl Into<Vec<Instruction>>,
+    ) -> Result<bool> {
+        let instructions = instructions.into();
+        let total_commands = instructions
+            .iter()
+            .filter(|i| matches!(i, Instruction::Command { .. }))
+            .count();
+        self.pb.set_length(total_commands as u64);
 
-    /// Runs `cargo +<toolchain> llvm-cov test --lcov --output-path target/cov/<cov_name>/lcov.info <extra_args...>`.
-    pub fn run_coverage(
-        &self,
-        toolchain: impl Into<Toolchain>,
-        cov_name: &str,
-        extra_args: &[&str],
-    ) -> Result<()> {
-        fs_err::create_dir_all(&self.shared.cov_base_dir)?;
+        let mut commands_run = 0;
+        self.pb.set_position(commands_run as u64);
 
-        let output_parent = self.shared.cov_base_dir.join(cov_name);
-        fs_err::create_dir_all(&output_parent)?;
-        let output_path = output_parent.join("lcov.info");
-        let output_path = output_path.to_string_lossy();
+        let shared = Arc::clone(&self.shared);
+        let mut lock = None;
 
-        let mut args = vec![
-            "llvm-cov",
-            "test",
-            "--lcov",
-            "--output-path",
-            output_path.as_ref(),
-        ];
-        args.extend_from_slice(extra_args);
+        let mut result = true;
 
-        self.run_cargo(toolchain, &args)
-    }
+        for instruction in instructions {
+            match instruction {
+                Instruction::Command { program, args } => {
+                    if !self.run_cmd(program, args)? {
+                        result = false;
+                    }
+                    commands_run += 1;
+                    self.pb.set_position(commands_run as u64);
+                }
+                Instruction::SetEnv { key, value } => {
+                    self.set_env(key, value);
+                }
+                Instruction::TakeMutex => {
+                    self.pb.set_message("Waiting for global fetch lock");
+                    lock = Some(shared.fetch_mutex.lock().unwrap());
+                }
+                Instruction::ReleaseMutex => {
+                    drop(lock.take());
+                }
+            }
+        }
 
-    /// Marks the track progress spinner as finished.
-    pub fn finish(&self, msg: &str) {
-        self.pb.finish_with_message(msg.to_owned());
+        self.print_summary();
+
+        Ok(result)
     }
 }
 

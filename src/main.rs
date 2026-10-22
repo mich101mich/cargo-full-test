@@ -10,6 +10,7 @@
 
 //! `cargo full-test` - Parallel full test, lint, coverage, MSRV, and minimal-versions runner.
 
+mod args;
 mod config;
 mod pipeline;
 mod runner;

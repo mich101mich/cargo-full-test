@@ -7,12 +7,9 @@ use std::{
 use anyhow::{Result, bail};
 
 use crate::{
+    args::{Instruction, args, cmd, set},
     config::Config,
-    runner::{
-        Shared,
-        Toolchain::{Nightly, Stable},
-        TrackRunner,
-    },
+    runner::{Shared, TrackRunner},
     workspace::Workspace,
 };
 
@@ -29,15 +26,17 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
     fs_err::create_dir_all(&cov_base_dir)?;
 
     let shared = Arc::new(Shared {
+        base_dir: config.base_dir.clone(),
         log_dir,
         cov_base_dir,
         multi_progress: indicatif::MultiProgress::new(),
+        fetch_mutex: std::sync::Mutex::new(()),
     });
 
     let base_workspace = Workspace::new_base_dir(&config.base_dir);
 
     // Phase 1: Pre-flight & Setup (Sequential)
-    run_setup_phase(config, base_workspace.clone(), Arc::clone(&shared))?;
+    let mut success = run_setup_instructions(config, Arc::clone(&shared), base_workspace.clone())?;
 
     let msrv_dir_name = format!("msrv_{}", config.msrv);
 
@@ -59,37 +58,41 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
     let min_versions_workspace = Workspace::new_isolated(&config.base_dir, "min_versions")?;
 
     // Phase 2: Parallel Test Tracks
-    let mut base_runner = TrackRunner::new("base", "Base", Arc::clone(&shared), base_workspace)?;
-    configure_base_env(&mut base_runner);
-    prepare_base_deps(&mut base_runner)?;
+    let base_runner = TrackRunner::new("base", "Base", Arc::clone(&shared), base_workspace)?;
 
-    let mut msrv_runner = TrackRunner::new(
+    let msrv_runner = TrackRunner::new(
         "msrv",
-        format!("MSRV ({})", config.msrv),
+        format!("MSRV {}", config.msrv),
         Arc::clone(&shared),
         msrv_workspace,
     )?;
-    configure_msrv_env(&mut msrv_runner);
-    prepare_msrv_deps(config, &mut msrv_runner)?;
 
-    let mut min_versions_runner = TrackRunner::new(
+    let min_versions_runner = TrackRunner::new(
         "min_versions",
         "MinVersions",
         Arc::clone(&shared),
         min_versions_workspace,
     )?;
-    configure_min_versions_env(&mut min_versions_runner);
-    prepare_min_versions_deps(&mut min_versions_runner)?;
 
-    std::thread::scope(|s| {
-        s.spawn(|| run_base_track(config, base_runner));
-        s.spawn(|| run_msrv_track(config, msrv_runner));
-        s.spawn(|| run_min_versions_track(min_versions_runner));
-    });
+    if success {
+        success = std::thread::scope(|s| {
+            let base = s.spawn(|| run_base_track(config, base_runner));
+            let msrv = s.spawn(|| run_msrv_track(config, msrv_runner));
+            let min_versions = s.spawn(|| run_min_versions_track(min_versions_runner));
+
+            base.join().is_ok_and(|r| r.is_ok_and(|r| r))
+                && msrv.join().is_ok_and(|r| r.is_ok_and(|r| r))
+                && min_versions.join().is_ok_and(|r| r.is_ok_and(|r| r))
+        });
+    }
 
     // Phase 3: Completion Summary
     let elapsed = start_time.elapsed().as_secs();
-    println!("All tests passed in {elapsed} seconds!");
+    if success {
+        println!("All tests passed in {elapsed} seconds!");
+    } else {
+        println!("Full-test run completed in {elapsed} seconds!");
+    }
 
     Ok(())
 }
@@ -110,119 +113,86 @@ fn verify_required_executables() -> Result<()> {
     Ok(())
 }
 
-fn run_setup_phase(config: &Config, base_workspace: Workspace, shared: Arc<Shared>) -> Result<()> {
-    let runner = TrackRunner::new("setup", "Setup", shared, base_workspace)?;
+fn run_setup_instructions(
+    config: &Config,
+    shared: Arc<Shared>,
+    workspace: Workspace,
+) -> Result<bool> {
+    let setup_runner = TrackRunner::new("setup", "Setup", shared, workspace)?;
 
-    runner.run_rustup(&["update"])?;
-    runner.run_rustup(&["install", "stable"])?;
-    runner.run_rustup(&["install", "nightly"])?;
-    runner.run_rustup(&["install", &config.msrv])?;
-    runner.run_rustup(&[
-        "component",
-        "add",
-        "--toolchain",
-        "stable",
-        "rustfmt",
-        "rust-src",
-        "llvm-tools-preview",
-    ])?;
-    runner.run_rustup(&[
-        "component",
-        "add",
-        "--toolchain",
-        "nightly",
-        "clippy",
-        "rust-src",
-        "llvm-tools-preview",
-    ])?;
-    runner.run_cargo(Stable, &["install", "cargo-llvm-cov"])?;
-
-    runner.finish("Done");
-    Ok(())
+    setup_runner.run_instructions(vec![
+        cmd!(rustup "update"),
+        cmd!(rustup "install" "stable"),
+        cmd!(rustup "install" "nightly"),
+        cmd!(rustup "install" {&config.msrv}),
+        cmd![rustup "component" "add" "--toolchain" "stable" "rustfmt" "rust-src" "llvm-tools-preview"],
+        cmd![rustup "component" "add" "--toolchain" "nightly" "clippy" "rust-src" "llvm-tools-preview"],
+        cmd!(cargo +stable "install" "cargo-llvm-cov"),
+    ])
 }
 
-fn configure_base_env(runner: &mut TrackRunner) {
-    runner.set_env("CARGO_BUILD_WARNINGS", "deny");
-    runner.set_env("RUSTDOCFLAGS", "-D warnings");
-}
+fn run_base_track(config: &Config, runner: TrackRunner) -> Result<bool> {
+    let cov_dir = &runner.shared.cov_base_dir;
+    let mut instructions = vec![
+        set!(CARGO_BUILD_WARNINGS = "deny"),
+        set!(RUSTDOCFLAGS = "-D warnings"),
+        Instruction::TakeMutex,
+        cmd!(cargo +stable "update"),
+        cmd!(cargo +stable "fetch"),
+        Instruction::ReleaseMutex,
+        set!(CARGO_NET_OFFLINE = "true"),
+        cmd!(cargo +stable "test" "--workspace"),
+        cmd!(coverage +nightly --out-dir {cov_dir/"nightly"} "--workspace"),
+        cmd!(cargo +nightly "doc" "--no-deps" "--workspace"),
+        cmd!(cargo +nightly "clippy" "--workspace" "--" "-D" "warnings"),
+        cmd!(cargo +stable "fmt" "--check" "--all"),
+    ];
 
-fn configure_msrv_env(runner: &mut TrackRunner) {
-    runner.set_env("RUSTFLAGS", "-D warnings"); // MSRV does not have CARGO_BUILD_WARNINGS yet
-}
-
-fn configure_min_versions_env(runner: &mut TrackRunner) {
-    runner.set_env("CARGO_BUILD_WARNINGS", "deny");
-}
-
-// Update lockfiles and pre-fetch/unpack all crates sequentially before launching
-// the parallel tracks so they don't contend on Cargo's global package cache lock.
-fn prepare_base_deps(runner: &mut TrackRunner) -> Result<()> {
-    runner.run_cargo(Stable, &["update"])?;
-    runner.run_cargo(Stable, &["fetch"])?;
-    runner.set_env("CARGO_NET_OFFLINE", "true");
-    Ok(())
-}
-
-fn prepare_msrv_deps(config: &Config, runner: &mut TrackRunner) -> Result<()> {
-    runner.run_cargo(&config.msrv, &["update"])?;
-
-    for ovr in &config.msrv_overrides {
-        runner.run_cargo(
-            &config.msrv,
-            &["update", "-p", &ovr.package, "--precise", &ovr.version],
-        )?;
-    }
-
-    runner.run_cargo(&config.msrv, &["fetch"])?;
-    runner.set_env("CARGO_NET_OFFLINE", "true");
-    Ok(())
-}
-
-fn prepare_min_versions_deps(runner: &mut TrackRunner) -> Result<()> {
-    runner.run_cargo(Nightly, &["-Z", "minimal-versions", "update"])?;
-    runner.run_cargo(Stable, &["fetch"])?;
-    runner.set_env("CARGO_NET_OFFLINE", "true");
-    Ok(())
-}
-
-fn run_base_track(config: &Config, mut runner: TrackRunner) -> Result<()> {
-    runner.run_cargo(Stable, &["test", "--workspace"])?;
-    runner.run_coverage(Nightly, "nightly", &["--workspace"])?;
-    runner.run_cargo(Nightly, &["doc", "--no-deps", "--workspace"])?;
-    runner.run_cargo(Nightly, &["clippy", "--workspace", "--", "-D", "warnings"])?;
-    runner.run_cargo(Stable, &["fmt", "--check", "--all"])?;
-
-    if config.run_error_message_tests {
+    if let Some(test_name) = &config.err_span_check_test {
         if config.frozen {
-            runner.set_env("ERR_SPAN_CHECK", "frozen");
+            instructions.push(set!(ERR_SPAN_CHECK = "frozen"));
         }
-        runner.run_coverage(
-            Stable,
-            "err_stable",
-            &["error_message_tests", "--workspace", "--", "--ignored"],
-        )?;
-        runner.run_coverage(
-            Nightly,
-            "err_nightly",
-            &["error_message_tests", "--workspace", "--", "--ignored"],
-        )?;
+
+        instructions.extend([
+            cmd!(coverage +stable --out-dir {cov_dir/"err_stable"} test_name "--" "--ignored"),
+            set!(ERR_SPAN_CHECK_SPLIT_ON_CHANGE = "true"),
+            cmd!(coverage +nightly --out-dir {cov_dir/"err_nightly"} test_name "--" "--ignored"),
+        ]);
     }
 
-    runner.finish("Passed");
-    Ok(())
+    runner.run_instructions(instructions)
 }
 
-fn run_msrv_track(config: &Config, runner: TrackRunner) -> Result<()> {
-    runner.run_cargo(&config.msrv, &["test", "--workspace"])?;
+fn run_msrv_track(config: &Config, runner: TrackRunner) -> Result<bool> {
+    let mut instructions = vec![
+        set!(RUSTFLAGS = "-D warnings"), // MSRV might not have CARGO_BUILD_WARNINGS yet
+        Instruction::TakeMutex,
+        cmd!(cargo +{config.msrv} "update"),
+    ];
 
-    runner.finish("Passed");
-    Ok(())
+    instructions.extend(config.msrv_overrides.iter().map(
+        |ovr| cmd!(cargo +{config.msrv} "update" "-p" {&ovr.package} "--precise" {&ovr.version}),
+    ));
+
+    instructions.extend([
+        cmd!(cargo +{config.msrv} "fetch"),
+        Instruction::ReleaseMutex,
+        set!(CARGO_NET_OFFLINE = "true"),
+        cmd!(cargo +{config.msrv} "test" "--workspace"),
+    ]);
+
+    runner.run_instructions(instructions)
 }
 
-fn run_min_versions_track(runner: TrackRunner) -> Result<()> {
-    runner.run_cargo(Stable, &["test", "--workspace"])?;
-    runner.run_cargo(Nightly, &["test", "--workspace"])?;
-
-    runner.finish("Passed");
-    Ok(())
+fn run_min_versions_track(runner: TrackRunner) -> Result<bool> {
+    runner.run_instructions([
+        set!(CARGO_BUILD_WARNINGS = "deny"),
+        Instruction::TakeMutex,
+        cmd!(cargo +nightly "-Z" "minimal-versions" "update"),
+        cmd!(cargo +stable "fetch"),
+        Instruction::ReleaseMutex,
+        set!(CARGO_NET_OFFLINE = "true"), // we can set this now that fetch is complete
+        cmd!(cargo +stable "test" "--workspace"),
+        cmd!(cargo +nightly "test" "--workspace"),
+    ])
 }
