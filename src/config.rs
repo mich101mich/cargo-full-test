@@ -1,22 +1,23 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use cargo_metadata::{DependencyKind, Metadata, MetadataCommand};
+use cargo_metadata::{Metadata, MetadataCommand};
 use serde::Deserialize;
+
+use crate::CliArgs;
 
 /// Per-crate or workspace settings deserialized from `[package.metadata.full-test]`
 /// or `[workspace.metadata.full-test]`.
 #[derive(Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct FullTestMetadata {
-    /// Override whether `error_message_tests` is run.
-    /// If omitted, auto-detected from `err_span_check` in dev-dependencies.
-    #[serde(alias = "error_message_tests")]
-    pub error_message_tests: Option<bool>,
+    /// Specifies the name of the (normally ignored) test that runs [`err_span_check`](https://crates.io/crates/err_span_check)
+    #[serde(alias = "err-span-check-test")]
+    pub err_span_check_test: Option<String>,
 
     /// List of `"package@version"` overrides applied during the MSRV test step
     /// via `cargo +<MSRV> update -p <package> --precise <version>`.
-    #[serde(default, alias = "msrv_overrides")]
+    #[serde(default, alias = "msrv-overrides")]
     pub msrv_overrides: Vec<String>,
 }
 
@@ -47,37 +48,60 @@ impl MsrvOverride {
     }
 }
 
+pub enum TestType {
+    Base,
+    Msrv,
+    MinVersions,
+    ErrSpanCheck,
+}
+
 /// Resolved configuration for running the full test suite on a crate/workspace.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Config {
     /// Root directory of the workspace/crate.
     pub base_dir: PathBuf,
     /// Minimum Supported Rust Version (e.g., `"1.88.0"`).
     pub msrv: String,
-    /// Whether to run `error_message_tests` on stable and nightly.
-    pub run_error_message_tests: bool,
+    /// Optional name of the (normally ignored) test that runs `err_span_check`
+    pub err_span_check_test: Option<String>,
     /// Dependency version overrides for MSRV testing.
     pub msrv_overrides: Vec<MsrvOverride>,
-    /// Whether `--frozen` was passed on the CLI (`ERR_SPAN_CHECK=frozen`).
-    pub frozen: bool,
+    /// Parsed CLI arguments.
+    pub args: CliArgs,
 }
 
 impl Config {
     /// Loads configuration from the Cargo workspace in the current directory (or `manifest_path`).
-    pub fn load(manifest_path: Option<&Path>, frozen: bool) -> Result<Self> {
+    pub fn load(args: CliArgs) -> Result<Self> {
         let mut cmd = MetadataCommand::new();
         cmd.no_deps();
-        if let Some(path) = manifest_path {
-            cmd.manifest_path(path);
-        }
         let metadata = cmd
             .exec()
             .context("Failed to execute `cargo metadata --no-deps`")?;
-        Self::from_metadata(&metadata, frozen)
+        Self::from_metadata(&metadata, args)
+    }
+
+    pub fn has_only(&self) -> bool {
+        self.args.only_base
+            || self.args.only_msrv
+            || self.args.only_min_versions
+            || self.args.only_err_span_check
+    }
+
+    pub fn should_run(&self, test_type: TestType) -> bool {
+        if !self.has_only() {
+            return true;
+        }
+        match test_type {
+            TestType::Base => self.args.only_base,
+            TestType::Msrv => self.args.only_msrv,
+            TestType::MinVersions => self.args.only_min_versions,
+            TestType::ErrSpanCheck => self.args.only_err_span_check,
+        }
     }
 
     /// Constructs a [`Config`] from an already-loaded [`Metadata`].
-    pub fn from_metadata(metadata: &Metadata, frozen: bool) -> Result<Self> {
+    fn from_metadata(metadata: &Metadata, args: CliArgs) -> Result<Self> {
         let base_dir = metadata.workspace_root.clone().into_std_path_buf();
 
         let root_package = metadata
@@ -111,21 +135,14 @@ impl Config {
             .map(|s| MsrvOverride::parse(s))
             .collect::<Result<Vec<_>>>()?;
 
-        let has_err_span_check_dev_dep = root_package
-            .dependencies
-            .iter()
-            .any(|dep| dep.name == "err_span_check" && dep.kind == DependencyKind::Development);
-
-        let run_error_message_tests = parsed_meta
-            .error_message_tests
-            .unwrap_or(has_err_span_check_dev_dep);
+        let error_span_test = parsed_meta.err_span_check_test.clone();
 
         Ok(Self {
             base_dir,
             msrv,
-            run_error_message_tests,
+            err_span_check_test: error_span_test,
             msrv_overrides,
-            frozen,
+            args,
         })
     }
 }
@@ -137,22 +154,28 @@ mod tests {
     #[test]
     fn parse_full_test_metadata_kebab_and_snake() {
         let json_kebab = serde_json::json!({
-            "error-message-tests": true,
+            "err-span-check-test": "test_name",
             "msrv-overrides": ["trybuild@1.0.109", "toml@0.9.6"]
         });
         let meta_kebab: FullTestMetadata = serde_json::from_value(json_kebab).unwrap();
-        assert_eq!(meta_kebab.error_message_tests, Some(true));
+        assert_eq!(
+            meta_kebab.err_span_check_test,
+            Some("test_name".to_string())
+        );
         assert_eq!(
             meta_kebab.msrv_overrides,
             vec!["trybuild@1.0.109", "toml@0.9.6"]
         );
 
         let json_snake = serde_json::json!({
-            "error_message_tests": false,
+            "err_span_check_test": "test_name",
             "msrv_overrides": ["serde_spanned@1.0.1"]
         });
         let meta_snake: FullTestMetadata = serde_json::from_value(json_snake).unwrap();
-        assert_eq!(meta_snake.error_message_tests, Some(false));
+        assert_eq!(
+            meta_snake.err_span_check_test,
+            Some("test_name".to_string())
+        );
         assert_eq!(meta_snake.msrv_overrides, vec!["serde_spanned@1.0.1"]);
     }
 
@@ -166,27 +189,5 @@ mod tests {
         assert!(MsrvOverride::parse("@1.0.0").is_err());
         assert!(MsrvOverride::parse("pkg@").is_err());
         assert!(MsrvOverride::parse("pkg@1.0@2.0").is_err());
-    }
-
-    #[test]
-    fn detect_err_span_check_and_sscanf_manifests() {
-        let err_span_check_manifest = Path::new(
-            r"c:\Users\mich101mich\Desktop\Programmieren\git\rs\OwnCrates\err_span_check\Cargo.toml",
-        );
-        if err_span_check_manifest.exists() {
-            let cfg = Config::load(Some(err_span_check_manifest), false).unwrap();
-            assert_eq!(cfg.msrv, "1.88.0");
-            assert!(!cfg.run_error_message_tests);
-        }
-
-        let sscanf_manifest = Path::new(
-            r"c:\Users\mich101mich\Desktop\Programmieren\git\rs\OwnCrates\sscanf\Cargo.toml",
-        );
-        if sscanf_manifest.exists() {
-            let cfg = Config::load(Some(sscanf_manifest), true).unwrap();
-            assert_eq!(cfg.msrv, "1.88.0");
-            assert!(cfg.run_error_message_tests);
-            assert!(cfg.frozen);
-        }
     }
 }

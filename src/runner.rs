@@ -1,70 +1,106 @@
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::{
+    borrow::Cow,
+    ffi::OsString,
+    io::{BufRead, BufReader, Write},
+    path::PathBuf,
+    process::{Command, Stdio},
+    sync::{Arc, Mutex},
+};
 
-use anyhow::{Context, Result, bail};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use ansi_str::AnsiStr;
+use anyhow::{Context, Result};
+use indicatif::{ProgressBar, ProgressStyle};
+
+use crate::{
+    args::{Args, Instruction},
+    workspace::Workspace,
+};
+
+#[derive(Debug)]
+pub struct Shared {
+    /// Base directory of the project.
+    pub base_dir: PathBuf,
+    /// Directory for storing log files.
+    pub log_dir: PathBuf,
+    /// Directory for storing coverage output.
+    pub cov_base_dir: PathBuf,
+    /// Multi-progress indicator for displaying live progress bars.
+    pub multi_progress: indicatif::MultiProgress,
+    /// Mutex for synchronizing fetch operations.
+    ///
+    /// Cargo locks the package registry in a way that deadlocks between MSRV and current cargo.
+    pub fetch_mutex: Mutex<()>,
+}
 
 /// Execution context for a single track (e.g. `Setup`, `Base`, `MSRV`, `MinVersions`).
 #[derive(Debug)]
 pub struct TrackRunner {
     /// Display name for the track (e.g., `"Base"`).
-    pub display_name: String,
-    /// Root workspace directory (`<base_dir>`).
-    pub base_dir: PathBuf,
-    /// Working directory where commands are executed.
-    pub work_dir: PathBuf,
+    pub display_name: Cow<'static, str>,
+    /// Directories associated with this track.
+    pub workspace: Workspace,
+    /// Shared information.
+    pub shared: Arc<Shared>,
     /// Path to the track's log file (`<base_dir>/target/test_<track_id>.log`).
     pub log_path: PathBuf,
     /// Environment variables to set on every command in this track.
-    pub env_set: Vec<(String, String)>,
-    /// Environment variables to remove on every command in this track.
-    pub env_remove: Vec<String>,
+    pub env_set: Vec<(String, OsString)>,
     /// Live progress bar for this track.
     pub pb: ProgressBar,
-    /// Shared cancellation flag across tracks.
-    pub cancelled: Arc<AtomicBool>,
+    /// Commands that were executed in this track.
+    pub commands: Vec<String>,
+    /// Output of a failed command, if any.
+    pub failed_output: Option<String>,
 }
 
 impl TrackRunner {
     /// Creates a new [`TrackRunner`] attached to `multi_progress`.
     pub fn new(
         track_id: &str,
-        display_name: &str,
-        base_dir: &Path,
-        work_dir: &Path,
-        multi_progress: &MultiProgress,
-        cancelled: Arc<AtomicBool>,
+        display_name: impl Into<Cow<'static, str>>,
+        shared: Arc<Shared>,
+        workspace: Workspace,
     ) -> Result<Self> {
-        let target_dir = base_dir.join("target");
-        fs_err::create_dir_all(&target_dir)?;
-        let log_path = target_dir.join(format!("test_{track_id}.log"));
+        fs_err::create_dir_all(&shared.log_dir)?;
+        let log_path = shared.log_dir.join(format!("test_{track_id}.log"));
+        let display_name = display_name.into();
 
-        let style = ProgressStyle::with_template("{spinner:.cyan} [{prefix:.bold}] {wide_msg}")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner());
+        let pb = Self::create_progress_bar(display_name.clone(), &shared.multi_progress);
 
-        let pb = multi_progress.add(ProgressBar::new_spinner());
-        pb.set_style(style);
-        pb.set_prefix(display_name.to_owned());
-        pb.enable_steady_tick(Duration::from_millis(100));
+        let env_set = vec![(
+            "CARGO_TARGET_DIR".into(),
+            workspace.cargo_target_dir.clone().into(),
+        )];
 
         Ok(Self {
-            display_name: display_name.to_owned(),
-            base_dir: base_dir.to_path_buf(),
-            work_dir: work_dir.to_path_buf(),
+            display_name,
+            workspace,
+            shared,
             log_path,
-            env_set: Vec::new(),
-            env_remove: Vec::new(),
+            env_set,
             pb,
-            cancelled,
+            commands: Vec::new(),
+            failed_output: None,
         })
     }
 
+    fn create_progress_bar(
+        display_name: Cow<'static, str>,
+        multi_progress: &indicatif::MultiProgress,
+    ) -> ProgressBar {
+        let style = ProgressStyle::with_template(
+            "[{prefix:12.bold}] {bar:10.cyan/blue} {pos}/{len} {wide_msg}",
+        )
+        .unwrap();
+        let pb = multi_progress.add(ProgressBar::new(0));
+        pb.set_style(style);
+        pb.set_prefix(display_name);
+        pb.enable_steady_tick(std::time::Duration::from_millis(100));
+        pb
+    }
+
     /// Sets an environment variable for commands in this track.
-    pub fn set_env(&mut self, key: impl Into<String>, val: impl Into<String>) {
+    pub fn set_env(&mut self, key: impl Into<String>, val: impl Into<OsString>) {
         let key = key.into();
         let val = val.into();
         if let Some((_, existing)) = self.env_set.iter_mut().find(|(k, _)| k == &key) {
@@ -74,51 +110,26 @@ impl TrackRunner {
         }
     }
 
-    /// Removes an environment variable for commands in this track.
-    pub fn remove_env(&mut self, key: impl Into<String>) {
-        self.env_remove.push(key.into());
-    }
-
     /// Runs a command in this track's working directory, logging raw output to `self.log_path`
     /// and updating the live spinner with the most recent output line.
-    pub fn run_cmd(&self, program: &str, args: &[&str]) -> Result<()> {
-        if self.cancelled.load(Ordering::Relaxed) {
-            bail!(
-                "[{}] Cancelled due to failure in another track",
-                self.display_name
-            );
-        }
+    pub fn run_cmd(&mut self, description: &str, program: &str, args: Args) -> Result<bool> {
+        let mut cmd_str = program.to_owned();
+        args.write_to(&mut cmd_str, &self.shared.base_dir);
 
-        let cmd_str = if args.is_empty() {
-            program.to_owned()
-        } else {
-            format!("{program} {}", args.join(" "))
-        };
+        self.commands.push(cmd_str.clone());
 
         self.pb.set_message(format!("Running {cmd_str}"));
 
         let mut log_file = fs_err::File::create(&self.log_path)?;
+        let log_path_name = self.log_path.display();
         writeln!(
             log_file,
-            "################################################################################"
-        )?;
-        writeln!(log_file, "### Log for {cmd_str}")?;
-        writeln!(
-            log_file,
-            "### This file is meant to be output to a terminal, so it still contains escape"
-        )?;
-        writeln!(
-            log_file,
-            "### sequences for coloring. If you want to read the log, use"
-        )?;
-        writeln!(
-            log_file,
-            "###     tail -n +7 \"{}\"",
-            self.log_path.display()
-        )?;
-        writeln!(
-            log_file,
-            "################################################################################"
+            r#"################################################################################
+### Log for {cmd_str}
+### This file is meant to be output to a terminal, so it still contains escape
+### sequences for coloring. If you want to read the log, use
+###     tail -n +7 "{log_path_name}"
+################################################################################"#
         )?;
 
         let (reader, writer) = std::io::pipe().context("Failed to create OS pipe")?;
@@ -128,17 +139,12 @@ impl TrackRunner {
 
         let mut cmd = Command::new(program);
         cmd.args(args)
-            .current_dir(&self.work_dir)
+            .current_dir(&self.workspace.work_dir)
             .env("CARGO_TERM_COLOR", "always")
+            .env("CARGO_CACHE_AUTO_CLEAN_FREQUENCY", "never") // avoid package lock from GC
+            .envs(self.env_set.iter().map(|(k, v)| (k, v))) // map to turn &(,) into (&, &)
             .stdout(Stdio::from(writer))
             .stderr(Stdio::from(writer_err));
-
-        for key in &self.env_remove {
-            cmd.env_remove(key);
-        }
-        for (key, val) in &self.env_set {
-            cmd.env(key, val);
-        }
 
         let mut child = cmd
             .spawn()
@@ -148,7 +154,7 @@ impl TrackRunner {
 
         let mut buf_reader = BufReader::new(reader);
         let mut line_buf = Vec::new();
-        let mut raw_output = String::new();
+        let mut full_output = String::new();
 
         loop {
             line_buf.clear();
@@ -159,15 +165,15 @@ impl TrackRunner {
                 break;
             }
 
-            log_file.write_all(&line_buf)?;
-            let line_lossy = String::from_utf8_lossy(&line_buf);
-            raw_output.push_str(&line_lossy);
+            log_file.write_all(&line_buf)?; // raw output to log file
 
-            let stripped = strip_ansi_codes(&line_lossy);
-            let trimmed = stripped.trim();
-            if !trimmed.is_empty() {
+            let line_string = String::from_utf8_lossy(&line_buf);
+            full_output.push_str(&line_string); // printable string to full output
+
+            let trimmed = line_string.ansi_trim();
+            if !trimmed.is_empty() && !trimmed.ansi_starts_with("Blocking waiting for file lock") {
                 self.pb
-                    .set_message(format!("Running {cmd_str} > {trimmed}"));
+                    .set_message(format!("Running {description} > {trimmed}"));
             }
         }
 
@@ -176,68 +182,89 @@ impl TrackRunner {
             .with_context(|| format!("Failed waiting for `{cmd_str}`"))?;
 
         if !status.success() {
-            self.cancelled.store(true, Ordering::Relaxed);
-            self.pb.finish_and_clear();
-            let mut stderr = std::io::stderr().lock();
-            let _ = writeln!(
-                stderr,
-                "\n=== [{}] Command failed: `{cmd_str}` ===",
-                self.display_name
-            );
-            let _ = write!(stderr, "{raw_output}");
-            let _ = stderr.flush();
-            bail!(
-                "[{}] Command `{cmd_str}` failed with status {status}",
-                self.display_name
-            );
+            self.failed_output = Some(format!(
+                r#"        Failed with status {status}
+========== output ==========
+{full_output}
+============================
+"#
+            ));
+            return Ok(false);
         }
 
-        Ok(())
+        Ok(true)
     }
 
-    /// Runs `cargo +<toolchain> llvm-cov test --lcov --output-path target/cov/<cov_name>/lcov.info <extra_args...>`.
-    pub fn run_coverage(&self, toolchain: &str, cov_name: &str, extra_args: &[&str]) -> Result<()> {
-        let cov_dir = self.base_dir.join("target").join("cov").join(cov_name);
-        fs_err::create_dir_all(&cov_dir)?;
+    pub fn print_summary(self) {
+        self.pb.finish_and_clear();
 
-        let output_path = format!("target/cov/{cov_name}/lcov.info");
-        let plus_toolchain = format!("+{toolchain}");
+        self.pb.suspend(|| {
+            let outcome = if self.failed_output.is_some() {
+                "failed"
+            } else {
+                "success"
+            };
+            println!(
+                "[{:12}] ({outcome})",
+                console::style(&self.display_name).bold()
+            );
 
-        let mut args = vec![
-            plus_toolchain.as_str(),
-            "llvm-cov",
-            "test",
-            "--lcov",
-            "--output-path",
-            output_path.as_str(),
-        ];
-        args.extend_from_slice(extra_args);
-
-        self.run_cmd("cargo", &args)
+            for cmd in &self.commands {
+                println!("    {}", cmd);
+            }
+            if let Some(failed_output) = &self.failed_output {
+                println!("{failed_output}");
+            }
+        });
     }
 
-    /// Marks the track progress spinner as finished.
-    pub fn finish(&self, msg: &str) {
-        self.pb.finish_with_message(msg.to_owned());
-    }
-}
+    pub(crate) fn run_instructions(
+        mut self,
+        instructions: impl Into<Vec<Instruction>>,
+    ) -> Result<bool> {
+        let instructions = instructions.into();
+        let total_commands = instructions
+            .iter()
+            .filter(|i| matches!(i, Instruction::Command { .. }))
+            .count();
+        self.pb.set_length(total_commands as u64);
 
-/// Strips ANSI CSI/OSC escape sequences and control characters from a single line
-/// so that it can be safely displayed inside an `indicatif` progress message.
-pub fn strip_ansi_codes(input: &str) -> String {
-    console::strip_ansi_codes(input)
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect()
-}
+        let mut commands_run = 0;
+        self.pb.set_position(commands_run as u64);
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+        let shared = Arc::clone(&self.shared);
+        let mut lock = None;
 
-    #[test]
-    fn strip_ansi_escape_sequences() {
-        let colored = "\x1b[1;32m   Compiling\x1b[0m foo v0.1.0\r\n";
-        assert_eq!(strip_ansi_codes(colored).trim(), "Compiling foo v0.1.0");
+        let mut result = true;
+
+        for instruction in instructions {
+            match instruction {
+                Instruction::Command {
+                    description,
+                    program,
+                    args,
+                } => {
+                    if !self.run_cmd(description, program, args)? {
+                        result = false;
+                    }
+                    commands_run += 1;
+                    self.pb.set_position(commands_run as u64);
+                }
+                Instruction::SetEnv { key, value } => {
+                    self.set_env(key, value);
+                }
+                Instruction::TakeMutex => {
+                    self.pb.set_message("Waiting for global fetch lock");
+                    lock = Some(shared.fetch_mutex.lock().unwrap());
+                }
+                Instruction::ReleaseMutex => {
+                    drop(lock.take());
+                }
+            }
+        }
+
+        self.print_summary();
+
+        Ok(result)
     }
 }
