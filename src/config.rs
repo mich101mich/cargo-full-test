@@ -1,8 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use cargo_metadata::{Metadata, MetadataCommand};
 use serde::Deserialize;
+
+use crate::CliArgs;
 
 /// Per-crate or workspace settings deserialized from `[package.metadata.full-test]`
 /// or `[workspace.metadata.full-test]`.
@@ -46,8 +48,15 @@ impl MsrvOverride {
     }
 }
 
+pub enum TestType {
+    Base,
+    Msrv,
+    MinVersions,
+    ErrSpanCheck,
+}
+
 /// Resolved configuration for running the full test suite on a crate/workspace.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Config {
     /// Root directory of the workspace/crate.
     pub base_dir: PathBuf,
@@ -57,26 +66,42 @@ pub struct Config {
     pub err_span_check_test: Option<String>,
     /// Dependency version overrides for MSRV testing.
     pub msrv_overrides: Vec<MsrvOverride>,
-    /// Whether `--frozen` was passed on the CLI (`ERR_SPAN_CHECK=frozen`).
-    pub frozen: bool,
+    /// Parsed CLI arguments.
+    pub args: CliArgs,
 }
 
 impl Config {
     /// Loads configuration from the Cargo workspace in the current directory (or `manifest_path`).
-    pub fn load(manifest_path: Option<&Path>, frozen: bool) -> Result<Self> {
+    pub fn load(args: CliArgs) -> Result<Self> {
         let mut cmd = MetadataCommand::new();
         cmd.no_deps();
-        if let Some(path) = manifest_path {
-            cmd.manifest_path(path);
-        }
         let metadata = cmd
             .exec()
             .context("Failed to execute `cargo metadata --no-deps`")?;
-        Self::from_metadata(&metadata, frozen)
+        Self::from_metadata(&metadata, args)
+    }
+
+    pub fn has_only(&self) -> bool {
+        self.args.only_base
+            || self.args.only_msrv
+            || self.args.only_min_versions
+            || self.args.only_err_span_check
+    }
+
+    pub fn should_run(&self, test_type: TestType) -> bool {
+        if !self.has_only() {
+            return true;
+        }
+        match test_type {
+            TestType::Base => self.args.only_base,
+            TestType::Msrv => self.args.only_msrv,
+            TestType::MinVersions => self.args.only_min_versions,
+            TestType::ErrSpanCheck => self.args.only_err_span_check,
+        }
     }
 
     /// Constructs a [`Config`] from an already-loaded [`Metadata`].
-    pub fn from_metadata(metadata: &Metadata, frozen: bool) -> Result<Self> {
+    fn from_metadata(metadata: &Metadata, args: CliArgs) -> Result<Self> {
         let base_dir = metadata.workspace_root.clone().into_std_path_buf();
 
         let root_package = metadata
@@ -117,7 +142,7 @@ impl Config {
             msrv,
             err_span_check_test: error_span_test,
             msrv_overrides,
-            frozen,
+            args,
         })
     }
 }
@@ -129,7 +154,7 @@ mod tests {
     #[test]
     fn parse_full_test_metadata_kebab_and_snake() {
         let json_kebab = serde_json::json!({
-            "error-message-test": "test_name",
+            "err-span-check-test": "test_name",
             "msrv-overrides": ["trybuild@1.0.109", "toml@0.9.6"]
         });
         let meta_kebab: FullTestMetadata = serde_json::from_value(json_kebab).unwrap();
@@ -143,7 +168,7 @@ mod tests {
         );
 
         let json_snake = serde_json::json!({
-            "error_span_test": "test_name",
+            "err_span_check_test": "test_name",
             "msrv_overrides": ["serde_spanned@1.0.1"]
         });
         let meta_snake: FullTestMetadata = serde_json::from_value(json_snake).unwrap();

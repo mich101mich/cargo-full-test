@@ -17,7 +17,6 @@ mod runner;
 mod workspace;
 
 use std::ffi::OsString;
-use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
@@ -30,16 +29,29 @@ use crate::config::Config;
     name = "cargo-full-test",
     bin_name = "cargo full-test",
     version,
-    about = "Run the full test, lint, coverage, MSRV, and minimal-versions verification suite in parallel"
+    about = "Run the full test, lint, coverage, MSRV, and minimal-versions verification suite",
+    infer_long_args = true
 )]
 pub struct CliArgs {
-    /// Enable frozen mode for `error_message_tests` (`ERR_SPAN_CHECK=frozen`).
+    /// Enable frozen mode for `err_span_check` tests (`ERR_SPAN_CHECK=frozen`).
     #[arg(long)]
     pub frozen: bool,
 
-    /// Optional path to `Cargo.toml`.
-    #[arg(long, value_name = "PATH")]
-    pub manifest_path: Option<PathBuf>,
+    /// Only run the base tests
+    #[arg(long, short)]
+    pub only_base: bool,
+
+    /// Only run MSRV tests
+    #[arg(long, short)]
+    pub only_msrv: bool,
+
+    /// Only run minimal-versions tests
+    #[arg(long, short, alias = "only-mv")]
+    pub only_min_versions: bool,
+
+    /// Only run err-span-check tests
+    #[arg(long, short)]
+    pub only_err_span_check: bool,
 }
 
 impl CliArgs {
@@ -55,7 +67,7 @@ impl CliArgs {
 
 fn main() -> Result<()> {
     let args = CliArgs::parse_from_env();
-    let config = Config::load(args.manifest_path.as_deref(), args.frozen)?;
+    let config = Config::load(args)?;
     pipeline::run_pipeline(&config)
 }
 

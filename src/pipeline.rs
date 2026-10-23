@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 
 use crate::{
     args::{Instruction, args, cmd, set},
-    config::Config,
+    config::{Config, TestType},
     runner::{Shared, TrackRunner},
     workspace::Workspace,
 };
@@ -78,7 +78,7 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
         success = std::thread::scope(|s| {
             let base = s.spawn(|| run_base_track(config, base_runner));
             let msrv = s.spawn(|| run_msrv_track(config, msrv_runner));
-            let min_versions = s.spawn(|| run_min_versions_track(min_versions_runner));
+            let min_versions = s.spawn(|| run_min_versions_track(config, min_versions_runner));
 
             base.join().is_ok_and(|r| r.is_ok_and(|r| r))
                 && msrv.join().is_ok_and(|r| r.is_ok_and(|r| r))
@@ -89,9 +89,10 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
     // Phase 3: Completion Summary
     let elapsed = start_time.elapsed().as_secs();
     if success {
-        println!("All tests passed in {elapsed} seconds!");
+        let scope = if config.has_only() { "Selected" } else { "All" };
+        println!("{scope} tests passed in {elapsed} seconds!");
     } else {
-        println!("Full-test run completed in {elapsed} seconds!");
+        println!("Full-test unsuccessful in {elapsed} seconds!");
     }
 
     Ok(())
@@ -122,9 +123,7 @@ fn run_setup_instructions(
 
     setup_runner.run_instructions(vec![
         cmd!(rustup "update"; "rustup update"),
-        cmd!(rustup "install" "stable"; "install stable"),
-        cmd!(rustup "install" "nightly"; "install nightly"),
-        cmd!(rustup "install" {&config.msrv}; "install msrv"),
+        cmd!(rustup "install" "stable" "nightly" {&config.msrv}; "rustup install"),
         cmd![rustup "component" "add" "--toolchain" "stable" "rustfmt" "rust-src" "llvm-tools-preview"; "add stable components"],
         cmd![rustup "component" "add" "--toolchain" "nightly" "clippy" "rust-src" "llvm-tools-preview"; "add nightly components"],
         cmd!(cargo +stable "install" "cargo-llvm-cov"; "install cargo-llvm-cov"),
@@ -132,6 +131,10 @@ fn run_setup_instructions(
 }
 
 fn run_base_track(config: &Config, runner: TrackRunner) -> Result<bool> {
+    if !config.should_run(TestType::Base) && !config.should_run(TestType::ErrSpanCheck) {
+        return Ok(true);
+    }
+
     let cov_dir = &runner.shared.cov_base_dir;
     let mut instructions = vec![
         set!(CARGO_BUILD_WARNINGS = "deny"),
@@ -141,15 +144,22 @@ fn run_base_track(config: &Config, runner: TrackRunner) -> Result<bool> {
         cmd!(cargo +stable "fetch"; "cargo fetch"),
         Instruction::ReleaseMutex,
         set!(CARGO_NET_OFFLINE = "true"),
-        cmd!(cargo +stable "test" "--workspace"; "stable test"),
-        cmd!(coverage +nightly --out-dir {cov_dir/"nightly"} "--workspace"; "nightly test coverage"),
-        cmd!(cargo +nightly "doc" "--no-deps" "--workspace"; "doc"),
-        cmd!(cargo +nightly "clippy" "--workspace" "--" "-D" "warnings"; "clippy"),
-        cmd!(cargo +stable "fmt" "--check" "--all"; "check fmt"),
     ];
 
-    if let Some(test_name) = &config.err_span_check_test {
-        if config.frozen {
+    if config.should_run(TestType::Base) {
+        instructions.extend([
+            cmd!(cargo +stable "test" "--workspace"; "stable test"),
+            cmd!(coverage +nightly --out-dir {cov_dir/"nightly"} "--workspace"; "nightly test coverage"),
+            cmd!(cargo +nightly "doc" "--no-deps" "--workspace"; "doc"),
+            cmd!(cargo +nightly "clippy" "--workspace" "--" "-D" "warnings"; "clippy"),
+            cmd!(cargo +stable "fmt" "--check" "--all"; "check fmt"),
+        ]);
+    }
+
+    if config.should_run(TestType::ErrSpanCheck)
+        && let Some(test_name) = &config.err_span_check_test
+    {
+        if config.args.frozen {
             instructions.push(set!(ERR_SPAN_CHECK = "frozen"));
         }
 
@@ -164,6 +174,10 @@ fn run_base_track(config: &Config, runner: TrackRunner) -> Result<bool> {
 }
 
 fn run_msrv_track(config: &Config, runner: TrackRunner) -> Result<bool> {
+    if !config.should_run(TestType::Msrv) {
+        return Ok(true);
+    }
+
     let mut instructions = vec![
         set!(RUSTFLAGS = "-D warnings"), // MSRV might not have CARGO_BUILD_WARNINGS yet
         Instruction::TakeMutex,
@@ -184,7 +198,11 @@ fn run_msrv_track(config: &Config, runner: TrackRunner) -> Result<bool> {
     runner.run_instructions(instructions)
 }
 
-fn run_min_versions_track(runner: TrackRunner) -> Result<bool> {
+fn run_min_versions_track(config: &Config, runner: TrackRunner) -> Result<bool> {
+    if !config.should_run(TestType::MinVersions) {
+        return Ok(true);
+    }
+
     runner.run_instructions([
         set!(CARGO_BUILD_WARNINGS = "deny"),
         Instruction::TakeMutex,
