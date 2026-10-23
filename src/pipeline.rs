@@ -185,7 +185,7 @@ fn run_msrv_track(config: &Config, runner: TrackRunner) -> Result<bool> {
     ];
 
     instructions.extend(config.msrv_overrides.iter().map(
-        |ovr| cmd!(cargo +{config.msrv} "update" "-p" {&ovr.package} "--precise" {&ovr.version}; "msrv override update"),
+        |ovr| cmd!(cargo +{config.msrv} "update" "--package" {&ovr.package} "--precise" {&ovr.version}; "msrv override update"),
     ));
 
     instructions.extend([
