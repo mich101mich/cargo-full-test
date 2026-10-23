@@ -121,13 +121,13 @@ fn run_setup_instructions(
     let setup_runner = TrackRunner::new("setup", "Setup", shared, workspace)?;
 
     setup_runner.run_instructions(vec![
-        cmd!(rustup "update"),
-        cmd!(rustup "install" "stable"),
-        cmd!(rustup "install" "nightly"),
-        cmd!(rustup "install" {&config.msrv}),
-        cmd![rustup "component" "add" "--toolchain" "stable" "rustfmt" "rust-src" "llvm-tools-preview"],
-        cmd![rustup "component" "add" "--toolchain" "nightly" "clippy" "rust-src" "llvm-tools-preview"],
-        cmd!(cargo +stable "install" "cargo-llvm-cov"),
+        cmd!(rustup "update"; "rustup update"),
+        cmd!(rustup "install" "stable"; "install stable"),
+        cmd!(rustup "install" "nightly"; "install nightly"),
+        cmd!(rustup "install" {&config.msrv}; "install msrv"),
+        cmd![rustup "component" "add" "--toolchain" "stable" "rustfmt" "rust-src" "llvm-tools-preview"; "add stable components"],
+        cmd![rustup "component" "add" "--toolchain" "nightly" "clippy" "rust-src" "llvm-tools-preview"; "add nightly components"],
+        cmd!(cargo +stable "install" "cargo-llvm-cov"; "install cargo-llvm-cov"),
     ])
 }
 
@@ -137,15 +137,15 @@ fn run_base_track(config: &Config, runner: TrackRunner) -> Result<bool> {
         set!(CARGO_BUILD_WARNINGS = "deny"),
         set!(RUSTDOCFLAGS = "-D warnings"),
         Instruction::TakeMutex,
-        cmd!(cargo +stable "update"),
-        cmd!(cargo +stable "fetch"),
+        cmd!(cargo +stable "update"; "cargo update"),
+        cmd!(cargo +stable "fetch"; "cargo fetch"),
         Instruction::ReleaseMutex,
         set!(CARGO_NET_OFFLINE = "true"),
-        cmd!(cargo +stable "test" "--workspace"),
-        cmd!(coverage +nightly --out-dir {cov_dir/"nightly"} "--workspace"),
-        cmd!(cargo +nightly "doc" "--no-deps" "--workspace"),
-        cmd!(cargo +nightly "clippy" "--workspace" "--" "-D" "warnings"),
-        cmd!(cargo +stable "fmt" "--check" "--all"),
+        cmd!(cargo +stable "test" "--workspace"; "stable test"),
+        cmd!(coverage +nightly --out-dir {cov_dir/"nightly"} "--workspace"; "nightly test coverage"),
+        cmd!(cargo +nightly "doc" "--no-deps" "--workspace"; "doc"),
+        cmd!(cargo +nightly "clippy" "--workspace" "--" "-D" "warnings"; "clippy"),
+        cmd!(cargo +stable "fmt" "--check" "--all"; "check fmt"),
     ];
 
     if let Some(test_name) = &config.err_span_check_test {
@@ -154,9 +154,9 @@ fn run_base_track(config: &Config, runner: TrackRunner) -> Result<bool> {
         }
 
         instructions.extend([
-            cmd!(coverage +stable --out-dir {cov_dir/"err_stable"} test_name "--" "--ignored"),
+            cmd!(coverage +stable --out-dir {cov_dir/"err_stable"} test_name "--" "--ignored"; "err_span_check stable"),
             set!(ERR_SPAN_CHECK_SPLIT_ON_CHANGE = "true"),
-            cmd!(coverage +nightly --out-dir {cov_dir/"err_nightly"} test_name "--" "--ignored"),
+            cmd!(coverage +nightly --out-dir {cov_dir/"err_nightly"} test_name "--" "--ignored"; "err_span_check nightly"),
         ]);
     }
 
@@ -167,18 +167,18 @@ fn run_msrv_track(config: &Config, runner: TrackRunner) -> Result<bool> {
     let mut instructions = vec![
         set!(RUSTFLAGS = "-D warnings"), // MSRV might not have CARGO_BUILD_WARNINGS yet
         Instruction::TakeMutex,
-        cmd!(cargo +{config.msrv} "update"),
+        cmd!(cargo +{config.msrv} "update"; "cargo update"),
     ];
 
     instructions.extend(config.msrv_overrides.iter().map(
-        |ovr| cmd!(cargo +{config.msrv} "update" "-p" {&ovr.package} "--precise" {&ovr.version}),
+        |ovr| cmd!(cargo +{config.msrv} "update" "-p" {&ovr.package} "--precise" {&ovr.version}; "msrv override update"),
     ));
 
     instructions.extend([
-        cmd!(cargo +{config.msrv} "fetch"),
+        cmd!(cargo +{config.msrv} "fetch"; "cargo fetch"),
         Instruction::ReleaseMutex,
         set!(CARGO_NET_OFFLINE = "true"),
-        cmd!(cargo +{config.msrv} "test" "--workspace"),
+        cmd!(cargo +{config.msrv} "test" "--workspace"; "msrv test"),
     ]);
 
     runner.run_instructions(instructions)
@@ -188,11 +188,11 @@ fn run_min_versions_track(runner: TrackRunner) -> Result<bool> {
     runner.run_instructions([
         set!(CARGO_BUILD_WARNINGS = "deny"),
         Instruction::TakeMutex,
-        cmd!(cargo +nightly "-Z" "minimal-versions" "update"),
-        cmd!(cargo +stable "fetch"),
+        cmd!(cargo +nightly "-Z" "minimal-versions" "update"; "minimal-versions update"),
+        cmd!(cargo +stable "fetch"; "cargo fetch"),
         Instruction::ReleaseMutex,
         set!(CARGO_NET_OFFLINE = "true"), // we can set this now that fetch is complete
-        cmd!(cargo +stable "test" "--workspace"),
-        cmd!(cargo +nightly "test" "--workspace"),
+        cmd!(cargo +stable "test" "--workspace"; "stable test"),
+        cmd!(cargo +nightly "test" "--workspace"; "nightly test"),
     ])
 }

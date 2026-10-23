@@ -7,6 +7,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use ansi_str::AnsiStr;
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -111,17 +112,11 @@ impl TrackRunner {
 
     /// Runs a command in this track's working directory, logging raw output to `self.log_path`
     /// and updating the live spinner with the most recent output line.
-    pub fn run_cmd(&mut self, program: &str, args: Args) -> Result<bool> {
+    pub fn run_cmd(&mut self, description: &str, program: &str, args: Args) -> Result<bool> {
         let mut cmd_str = program.to_owned();
         args.write_to(&mut cmd_str, &self.shared.base_dir);
 
         self.commands.push(cmd_str.clone());
-
-        let short_cmd_str = if cmd_str.len() > 40 {
-            format!("{}..", &cmd_str[..38])
-        } else {
-            cmd_str.clone()
-        };
 
         self.pb.set_message(format!("Running {cmd_str}"));
 
@@ -147,12 +142,9 @@ impl TrackRunner {
             .current_dir(&self.workspace.work_dir)
             .env("CARGO_TERM_COLOR", "always")
             .env("CARGO_CACHE_AUTO_CLEAN_FREQUENCY", "never") // avoid package lock from GC
+            .envs(self.env_set.iter().map(|(k, v)| (k, v))) // map to turn &(,) into (&, &)
             .stdout(Stdio::from(writer))
             .stderr(Stdio::from(writer_err));
-
-        for (key, val) in &self.env_set {
-            cmd.env(key, val);
-        }
 
         let mut child = cmd
             .spawn()
@@ -162,7 +154,7 @@ impl TrackRunner {
 
         let mut buf_reader = BufReader::new(reader);
         let mut line_buf = Vec::new();
-        let mut raw_output = String::new();
+        let mut full_output = String::new();
 
         loop {
             line_buf.clear();
@@ -173,15 +165,15 @@ impl TrackRunner {
                 break;
             }
 
-            log_file.write_all(&line_buf)?;
-            let line_lossy = String::from_utf8_lossy(&line_buf);
-            raw_output.push_str(&line_lossy);
+            log_file.write_all(&line_buf)?; // raw output to log file
 
-            let stripped = strip_ansi_codes(&line_lossy);
-            let trimmed = stripped.trim();
-            if !trimmed.is_empty() && !trimmed.starts_with("Blocking waiting for file lock") {
+            let line_string = String::from_utf8_lossy(&line_buf);
+            full_output.push_str(&line_string); // printable string to full output
+
+            let trimmed = line_string.ansi_trim();
+            if !trimmed.is_empty() && !trimmed.ansi_starts_with("Blocking waiting for file lock") {
                 self.pb
-                    .set_message(format!("Running {short_cmd_str} > {trimmed}"));
+                    .set_message(format!("Running {description} > {trimmed}"));
             }
         }
 
@@ -193,7 +185,7 @@ impl TrackRunner {
             self.failed_output = Some(format!(
                 r#"        Failed with status {status}
 ========== output ==========
-{raw_output}
+{full_output}
 ============================
 "#
             ));
@@ -247,8 +239,12 @@ impl TrackRunner {
 
         for instruction in instructions {
             match instruction {
-                Instruction::Command { program, args } => {
-                    if !self.run_cmd(program, args)? {
+                Instruction::Command {
+                    description,
+                    program,
+                    args,
+                } => {
+                    if !self.run_cmd(description, program, args)? {
                         result = false;
                     }
                     commands_run += 1;
@@ -270,25 +266,5 @@ impl TrackRunner {
         self.print_summary();
 
         Ok(result)
-    }
-}
-
-/// Strips ANSI CSI/OSC escape sequences and control characters from a single line
-/// so that it can be safely displayed inside an `indicatif` progress message.
-pub fn strip_ansi_codes(input: &str) -> String {
-    console::strip_ansi_codes(input)
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn strip_ansi_escape_sequences() {
-        let colored = "\x1b[1;32m   Compiling\x1b[0m foo v0.1.0\r\n";
-        assert_eq!(strip_ansi_codes(colored).trim(), "Compiling foo v0.1.0");
     }
 }

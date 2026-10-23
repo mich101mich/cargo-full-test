@@ -2,9 +2,10 @@
 name = "cargo-full-test"
 version = "0.1.0"
 edition = "2024"
-description = "Parallel full test, lint, coverage, MSRV, and minimal-versions runner"
+description = "Full test, lint, coverage, MSRV, and minimal-versions runner"
 
 [dependencies]
+ansi-str = "0.9.0"
 anyhow = "1.0.95"
 cargo_metadata = "0.23.0"
 clap = { version = "4.5.20", features = ["derive"] }

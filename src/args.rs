@@ -14,32 +14,23 @@ macro_rules! args {
 pub(crate) use args;
 
 macro_rules! cmd {
-    ( cargo +stable $( $arg:expr )* ) => {
-        Instruction::command("cargo", args!("+stable", $( $arg ),* ))
+    ( cargo +$toolchain:ident $( $arg:expr )* ; $description:literal ) => {
+        Instruction::command($description, "cargo", args!(concat!("+", stringify!($toolchain)), $( $arg ),* ))
     };
-    ( cargo +nightly $( $arg:expr )* ) => {
-        Instruction::command("cargo", args!("+nightly", $( $arg ),* ))
+    ( cargo +{$version:expr} $( $arg:expr )* ; $description:literal ) => {
+        Instruction::command($description, "cargo", args!(format!("+{}", $version), $( $arg ),* ))
     };
-    ( cargo +{$version:expr} $( $arg:expr )* ) => {
-        Instruction::command("cargo", args!(format!("+{}", $version), $( $arg ),* ))
+
+    ( rustup $( $arg:expr )* ; $description:literal ) => {
+        Instruction::command($description, "rustup", args!( $( $arg ),* ))
     };
-    ( rustup $( $arg:expr )* ) => {
-        Instruction::command("rustup", args!( $( $arg ),* ))
-    };
-    ( coverage +stable --out-dir {$dir:ident / $cov_name:literal} $( $arg:expr )* ) => {
+
+    ( coverage + $toolchain:ident --out-dir {$dir:ident / $cov_name:literal} $( $arg:expr )* ; $description:literal ) => {
         {
             let out_dir = $dir.join($cov_name);
             fs_err::create_dir_all(&out_dir)?;
             let out_file = out_dir.join("lcov.info");
-            Instruction::command("cargo", args!("+stable", "llvm-cov", "test", "--lcov", "--output-path", out_file, $( $arg ),*))
-        }
-    };
-    ( coverage +nightly --out-dir {$dir:ident / $cov_name:literal} $( $arg:expr )* ) => {
-        {
-            let out_dir = $dir.join($cov_name);
-            fs_err::create_dir_all(&out_dir)?;
-            let out_file = out_dir.join("lcov.info");
-            Instruction::command("cargo", args!("+nightly", "llvm-cov", "test", "--lcov", "--output-path", out_file, $( $arg ),*))
+            Instruction::command($description, "cargo", args!(concat!("+", stringify!($toolchain)), "llvm-cov", "test", "--lcov", "--output-path", out_file, $( $arg ),*))
         }
     };
 }
@@ -54,6 +45,7 @@ pub(crate) use set;
 
 pub enum Instruction {
     Command {
+        description: &'static str,
         program: &'static str,
         args: Args,
     },
@@ -65,8 +57,12 @@ pub enum Instruction {
     ReleaseMutex,
 }
 impl Instruction {
-    pub fn command(program: &'static str, args: Args) -> Self {
-        Self::Command { program, args }
+    pub fn command(description: &'static str, program: &'static str, args: Args) -> Self {
+        Self::Command {
+            description,
+            program,
+            args,
+        }
     }
     pub fn set_env(key: &'static str, value: &'static str) -> Self {
         Self::SetEnv { key, value }
