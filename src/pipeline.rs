@@ -4,11 +4,12 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use lcov::Report;
 
 use crate::{
-    args::{Instruction, args, cmd, set},
     config::{Config, TestType},
+    instruction::{Instruction, args, cmd, set},
     runner::{Shared, TrackRunner},
     workspace::Workspace,
 };
@@ -36,7 +37,13 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
     let base_workspace = Workspace::new_base_dir(&config.base_dir);
 
     // Phase 1: Pre-flight & Setup (Sequential)
-    let mut success = run_setup_instructions(config, Arc::clone(&shared), base_workspace.clone())?;
+    let setup_runner = TrackRunner::new(
+        "setup",
+        "Setup",
+        Arc::clone(&shared),
+        base_workspace.clone(),
+    )?;
+    let mut result = setup_runner.run_instructions(setup_instructions(config))?;
 
     let msrv_dir_name = format!("msrv_{}", config.msrv);
 
@@ -59,6 +66,7 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
 
     // Phase 2: Parallel Test Tracks
     let base_runner = TrackRunner::new("base", "Base", Arc::clone(&shared), base_workspace)?;
+    let base_instructions = base_track(config);
 
     let msrv_runner = TrackRunner::new(
         "msrv",
@@ -66,6 +74,7 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
         Arc::clone(&shared),
         msrv_workspace,
     )?;
+    let msrv_instructions = msrv_track(config);
 
     let min_versions_runner = TrackRunner::new(
         "min_versions",
@@ -73,26 +82,112 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
         Arc::clone(&shared),
         min_versions_workspace,
     )?;
+    let min_versions_instructions = min_versions_track(config);
 
-    if success {
-        success = std::thread::scope(|s| {
-            let base = s.spawn(|| run_base_track(config, base_runner));
-            let msrv = s.spawn(|| run_msrv_track(config, msrv_runner));
-            let min_versions = s.spawn(|| run_min_versions_track(config, min_versions_runner));
+    if result.success {
+        std::thread::scope(|s| -> Result<()> {
+            let should_run_base =
+                config.should_run(TestType::Base) || config.should_run(TestType::ErrSpanCheck);
+            let base = should_run_base
+                .then(|| s.spawn(|| base_runner.run_instructions(base_instructions)));
 
-            base.join().is_ok_and(|r| r.is_ok_and(|r| r))
-                && msrv.join().is_ok_and(|r| r.is_ok_and(|r| r))
-                && min_versions.join().is_ok_and(|r| r.is_ok_and(|r| r))
-        });
+            let msrv = config
+                .should_run(TestType::Msrv)
+                .then(|| s.spawn(|| msrv_runner.run_instructions(msrv_instructions)));
+
+            let min_versions = config.should_run(TestType::MinVersions).then(|| {
+                s.spawn(|| min_versions_runner.run_instructions(min_versions_instructions))
+            });
+
+            if let Some(base) = base {
+                result.and_assign(base.join().expect("Failed to join thread")?);
+            }
+            if let Some(msrv) = msrv {
+                result.and_assign(msrv.join().expect("Failed to join thread")?);
+            }
+            if let Some(min_versions) = min_versions {
+                result.and_assign(min_versions.join().expect("Failed to join thread")?);
+            }
+            Ok(())
+        })?;
     }
 
     // Phase 3: Completion Summary
     let elapsed = start_time.elapsed().as_secs();
-    if success {
+    if result.success {
         let scope = if config.has_only() { "Selected" } else { "All" };
         println!("{scope} tests passed in {elapsed} seconds!");
     } else {
         println!("Full-test unsuccessful in {elapsed} seconds!");
+    }
+
+    if !result.coverage_reports.is_empty() {
+        // Phase 4: Coverage Report
+        let mut report = Report::new();
+        for part_report in result.coverage_reports {
+            report
+                .merge(part_report)
+                .context("Failed to merge coverage report")?;
+        }
+
+        let merged_cov_path = shared.cov_base_dir.join("lcov.info");
+        let mut merged_cov_file = std::fs::File::create(&merged_cov_path)
+            .context("Failed to create merged coverage file")?;
+
+        #[derive(Default)]
+        struct Counter {
+            total: u64,
+            hit: u64,
+        }
+        impl Counter {
+            fn add(&mut self, hit_count: u64) {
+                self.total += 1;
+                if hit_count > 0 {
+                    self.hit += 1;
+                }
+            }
+        }
+        impl std::fmt::Display for Counter {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let percent = (self.hit as f64 / self.total as f64) * 100.0;
+                write!(f, "{}/{} ({percent:.2}%)", self.hit, self.total)
+            }
+        }
+
+        let mut line_stat = Counter::default();
+        let mut function_stat = Counter::default();
+        let mut branch_stat = Counter::default();
+        for v in report.sections.values() {
+            for line in v.lines.values() {
+                line_stat.add(line.count);
+            }
+            for function in v.functions.values() {
+                function_stat.add(function.count);
+            }
+            for branch in v.branches.values() {
+                branch_stat.add(branch.taken.unwrap_or(0));
+            }
+        }
+        print!("Coverage summary:");
+        if line_stat.total > 0 {
+            print!(" lines {line_stat}");
+        }
+        if function_stat.total > 0 {
+            print!(" functions {function_stat}");
+        }
+        if branch_stat.total > 0 {
+            print!(" branches {branch_stat}");
+        }
+        println!();
+
+        for record in report.into_records() {
+            use std::io::Write;
+            writeln!(merged_cov_file, "{}", record)
+                .context("Failed to write to merged coverage file")?;
+        }
+
+        let relative_path = merged_cov_path.strip_prefix(&shared.base_dir).unwrap(); // unwrap: path was created through `join`s
+        println!("Merged coverage report: {}", relative_path.display());
     }
 
     Ok(())
@@ -114,28 +209,17 @@ fn verify_required_executables() -> Result<()> {
     Ok(())
 }
 
-fn run_setup_instructions(
-    config: &Config,
-    shared: Arc<Shared>,
-    workspace: Workspace,
-) -> Result<bool> {
-    let setup_runner = TrackRunner::new("setup", "Setup", shared, workspace)?;
-
-    setup_runner.run_instructions(vec![
+fn setup_instructions(config: &Config) -> Vec<Instruction> {
+    vec![
         cmd!(rustup "update"; "rustup update"),
         cmd!(rustup "install" "stable" "nightly" {&config.msrv}; "rustup install"),
         cmd![rustup "component" "add" "--toolchain" "stable" "rustfmt" "rust-src" "llvm-tools-preview"; "add stable components"],
         cmd![rustup "component" "add" "--toolchain" "nightly" "clippy" "rust-src" "llvm-tools-preview"; "add nightly components"],
         cmd!(cargo +stable "install" "cargo-llvm-cov"; "install cargo-llvm-cov"),
-    ])
+    ]
 }
 
-fn run_base_track(config: &Config, runner: TrackRunner) -> Result<bool> {
-    if !config.should_run(TestType::Base) && !config.should_run(TestType::ErrSpanCheck) {
-        return Ok(true);
-    }
-
-    let cov_dir = &runner.shared.cov_base_dir;
+fn base_track(config: &Config) -> Vec<Instruction> {
     let mut instructions = vec![
         set!(CARGO_BUILD_WARNINGS = "deny"),
         set!(RUSTDOCFLAGS = "-D warnings"),
@@ -149,7 +233,7 @@ fn run_base_track(config: &Config, runner: TrackRunner) -> Result<bool> {
     if config.should_run(TestType::Base) {
         instructions.extend([
             cmd!(cargo +stable "test" "--workspace"; "stable test"),
-            cmd!(coverage +nightly --out-dir {cov_dir/"nightly"} "--workspace"; "nightly test coverage"),
+            cmd!(coverage +nightly "--workspace"; "nightly"; "nightly test coverage"),
             cmd!(cargo +nightly "doc" "--no-deps" "--workspace"; "doc"),
             cmd!(cargo +nightly "clippy" "--workspace" "--" "-D" "warnings"; "clippy"),
             cmd!(cargo +stable "fmt" "--check" "--all"; "check fmt"),
@@ -164,20 +248,16 @@ fn run_base_track(config: &Config, runner: TrackRunner) -> Result<bool> {
         }
 
         instructions.extend([
-            cmd!(coverage +stable --out-dir {cov_dir/"err_stable"} test_name "--" "--ignored"; "err_span_check stable"),
+            cmd!(coverage +stable test_name "--" "--ignored"; "err_stable"; "err_span_check stable"),
             set!(ERR_SPAN_CHECK_SPLIT_ON_CHANGE = "true"),
-            cmd!(coverage +nightly --out-dir {cov_dir/"err_nightly"} test_name "--" "--ignored"; "err_span_check nightly"),
+            cmd!(coverage +nightly test_name "--" "--ignored"; "err_nightly"; "err_span_check nightly"),
         ]);
     }
 
-    runner.run_instructions(instructions)
+    instructions
 }
 
-fn run_msrv_track(config: &Config, runner: TrackRunner) -> Result<bool> {
-    if !config.should_run(TestType::Msrv) {
-        return Ok(true);
-    }
-
+fn msrv_track(config: &Config) -> Vec<Instruction> {
     let mut instructions = vec![
         set!(RUSTFLAGS = "-D warnings"), // MSRV might not have CARGO_BUILD_WARNINGS yet
         Instruction::TakeMutex,
@@ -195,15 +275,11 @@ fn run_msrv_track(config: &Config, runner: TrackRunner) -> Result<bool> {
         cmd!(cargo +{config.msrv} "test" "--workspace"; "msrv test"),
     ]);
 
-    runner.run_instructions(instructions)
+    instructions
 }
 
-fn run_min_versions_track(config: &Config, runner: TrackRunner) -> Result<bool> {
-    if !config.should_run(TestType::MinVersions) {
-        return Ok(true);
-    }
-
-    runner.run_instructions([
+fn min_versions_track(_config: &Config) -> Vec<Instruction> {
+    vec![
         set!(CARGO_BUILD_WARNINGS = "deny"),
         Instruction::TakeMutex,
         cmd!(cargo +nightly "-Z" "minimal-versions" "update"; "minimal-versions update"),
@@ -212,5 +288,5 @@ fn run_min_versions_track(config: &Config, runner: TrackRunner) -> Result<bool> 
         set!(CARGO_NET_OFFLINE = "true"), // we can set this now that fetch is complete
         cmd!(cargo +stable "test" "--workspace"; "stable test"),
         cmd!(cargo +nightly "test" "--workspace"; "nightly test"),
-    ])
+    ]
 }

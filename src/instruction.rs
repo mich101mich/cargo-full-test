@@ -1,11 +1,12 @@
 use std::{borrow::Cow, ffi::OsStr, path::PathBuf};
 
 macro_rules! args {
-    ( $( $arg:expr ),* ) => {
+    ( $( $arg:expr )* ) => {
         {
-            let mut args = crate::args::Args(Vec::new());
+            let mut args = crate::instruction::Args(Vec::new());
             $(
-                args.append(crate::args::ArgLike::from($arg));
+                #[allow(unused_braces)]
+                args.append(crate::instruction::ArgLike::from($arg));
             )*
             args
         }
@@ -15,22 +16,19 @@ pub(crate) use args;
 
 macro_rules! cmd {
     ( cargo +$toolchain:ident $( $arg:expr )* ; $description:literal ) => {
-        Instruction::command($description, "cargo", args!(concat!("+", stringify!($toolchain)), $( $arg ),* ))
+        Instruction::command($description, "cargo", args!(concat!("+", stringify!($toolchain)) $( $arg )* ))
     };
     ( cargo +{$version:expr} $( $arg:expr )* ; $description:literal ) => {
-        Instruction::command($description, "cargo", args!(format!("+{}", $version), $( $arg ),* ))
+        Instruction::command($description, "cargo", args!(format!("+{}", $version) $( $arg )* ))
     };
 
     ( rustup $( $arg:expr )* ; $description:literal ) => {
-        Instruction::command($description, "rustup", args!( $( $arg ),* ))
+        Instruction::command($description, "rustup", args!( $( $arg )* ))
     };
 
-    ( coverage + $toolchain:ident --out-dir {$dir:ident / $cov_name:literal} $( $arg:expr )* ; $description:literal ) => {
+    ( coverage +$toolchain:ident $( $extra_arg:expr )* ; $cov_name:literal ; $description:literal ) => {
         {
-            let out_dir = $dir.join($cov_name);
-            fs_err::create_dir_all(&out_dir)?;
-            let out_file = out_dir.join("lcov.info");
-            Instruction::command($description, "cargo", args!(concat!("+", stringify!($toolchain)), "llvm-cov", "test", "--lcov", "--output-path", out_file, $( $arg ),*))
+            Instruction::coverage($description, $cov_name, concat!("+", stringify!($toolchain)), args!( $( $extra_arg )* ))
         }
     };
 }
@@ -49,6 +47,12 @@ pub enum Instruction {
         program: &'static str,
         args: Args,
     },
+    Coverage {
+        description: &'static str,
+        coverage_name: &'static str,
+        toolchain: &'static str,
+        extra_args: Args,
+    },
     SetEnv {
         key: &'static str,
         value: &'static str,
@@ -64,8 +68,25 @@ impl Instruction {
             args,
         }
     }
+    pub fn coverage(
+        description: &'static str,
+        coverage_name: &'static str,
+        toolchain: &'static str,
+        extra_args: Args,
+    ) -> Self {
+        Self::Coverage {
+            description,
+            coverage_name,
+            toolchain,
+            extra_args,
+        }
+    }
     pub fn set_env(key: &'static str, value: &'static str) -> Self {
         Self::SetEnv { key, value }
+    }
+
+    pub fn runs_command(&self) -> bool {
+        matches!(self, Self::Command { .. } | Self::Coverage { .. })
     }
 }
 

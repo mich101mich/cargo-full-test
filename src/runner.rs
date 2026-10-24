@@ -10,9 +10,10 @@ use std::{
 use ansi_str::AnsiStr;
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
+use lcov::Report;
 
 use crate::{
-    args::{Args, Instruction},
+    instruction::{Args, Instruction, args},
     workspace::Workspace,
 };
 
@@ -51,6 +52,23 @@ pub struct TrackRunner {
     pub commands: Vec<String>,
     /// Output of a failed command, if any.
     pub failed_output: Option<String>,
+    /// Coverage output files from this track.
+    pub coverage_reports: Vec<Report>,
+}
+
+/// Result of executing a track
+#[derive(Debug)]
+pub struct RunResult {
+    /// Indicates whether the run was successful.
+    pub success: bool,
+    /// Coverage output files generated during the run.
+    pub coverage_reports: Vec<Report>,
+}
+impl RunResult {
+    pub fn and_assign(&mut self, other: RunResult) {
+        self.success &= other.success;
+        self.coverage_reports.extend(other.coverage_reports);
+    }
 }
 
 impl TrackRunner {
@@ -81,6 +99,7 @@ impl TrackRunner {
             pb,
             commands: Vec::new(),
             failed_output: None,
+            coverage_reports: Vec::new(),
         })
     }
 
@@ -100,7 +119,7 @@ impl TrackRunner {
     }
 
     /// Sets an environment variable for commands in this track.
-    pub fn set_env(&mut self, key: impl Into<String>, val: impl Into<OsString>) {
+    fn set_env(&mut self, key: impl Into<String>, val: impl Into<OsString>) {
         let key = key.into();
         let val = val.into();
         if let Some((_, existing)) = self.env_set.iter_mut().find(|(k, _)| k == &key) {
@@ -112,7 +131,7 @@ impl TrackRunner {
 
     /// Runs a command in this track's working directory, logging raw output to `self.log_path`
     /// and updating the live spinner with the most recent output line.
-    pub fn run_cmd(&mut self, description: &str, program: &str, args: Args) -> Result<bool> {
+    fn run_cmd(&mut self, description: &str, program: &str, args: Args) -> Result<bool> {
         let mut cmd_str = program.to_owned();
         args.write_to(&mut cmd_str, &self.shared.base_dir);
 
@@ -195,7 +214,7 @@ impl TrackRunner {
         Ok(true)
     }
 
-    pub fn print_summary(self) {
+    fn print_summary(&self) {
         self.pb.finish_and_clear();
 
         self.pb.suspend(|| {
@@ -221,12 +240,9 @@ impl TrackRunner {
     pub(crate) fn run_instructions(
         mut self,
         instructions: impl Into<Vec<Instruction>>,
-    ) -> Result<bool> {
+    ) -> Result<RunResult> {
         let instructions = instructions.into();
-        let total_commands = instructions
-            .iter()
-            .filter(|i| matches!(i, Instruction::Command { .. }))
-            .count();
+        let total_commands = instructions.iter().filter(|i| i.runs_command()).count();
         self.pb.set_length(total_commands as u64);
 
         let mut commands_run = 0;
@@ -235,9 +251,13 @@ impl TrackRunner {
         let shared = Arc::clone(&self.shared);
         let mut lock = None;
 
-        let mut result = true;
+        let mut success = true;
 
         for instruction in instructions {
+            if instruction.runs_command() {
+                commands_run += 1;
+            }
+
             match instruction {
                 Instruction::Command {
                     description,
@@ -245,10 +265,32 @@ impl TrackRunner {
                     args,
                 } => {
                     if !self.run_cmd(description, program, args)? {
-                        result = false;
+                        success = false;
+                        break;
                     }
-                    commands_run += 1;
-                    self.pb.set_position(commands_run as u64);
+                }
+                Instruction::Coverage {
+                    description,
+                    coverage_name,
+                    toolchain,
+                    extra_args,
+                } => {
+                    let coverage_dir = self.shared.cov_base_dir.join(coverage_name);
+                    fs_err::create_dir_all(&coverage_dir)?;
+
+                    let coverage_file = coverage_dir.join("lcov.info");
+
+                    let args = args!(toolchain "llvm-cov" "test" "--lcov" "--output-path" {coverage_file.clone()} {..extra_args});
+
+                    if !self.run_cmd(description, "cargo", args)? {
+                        success = false;
+                        break;
+                    }
+
+                    let report = Report::from_file(&coverage_file)
+                        .context("Failed to read coverage report")?;
+
+                    self.coverage_reports.push(report);
                 }
                 Instruction::SetEnv { key, value } => {
                     self.set_env(key, value);
@@ -261,10 +303,15 @@ impl TrackRunner {
                     drop(lock.take());
                 }
             }
+
+            self.pb.set_position(commands_run as u64);
         }
 
         self.print_summary();
 
-        Ok(result)
+        Ok(RunResult {
+            success,
+            coverage_reports: self.coverage_reports,
+        })
     }
 }
