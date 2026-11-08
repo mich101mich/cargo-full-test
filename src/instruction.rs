@@ -27,9 +27,7 @@ macro_rules! cmd {
     };
 
     ( coverage +$toolchain:ident $( $extra_arg:expr )* ; $cov_name:literal ; $description:literal ) => {
-        {
-            Instruction::coverage($description, $cov_name, concat!("+", stringify!($toolchain)), args!( $( $extra_arg )* ))
-        }
+        Instruction::coverage($description, $cov_name, concat!("+", stringify!($toolchain)), args!( $( $extra_arg )* ))
     };
 }
 pub(crate) use cmd;

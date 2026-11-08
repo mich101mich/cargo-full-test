@@ -9,6 +9,7 @@ use std::{
 
 use ansi_str::AnsiStr;
 use anyhow::{Context, Result};
+use fs_err::File;
 use indicatif::{ProgressBar, ProgressStyle};
 use lcov::Report;
 
@@ -43,7 +44,7 @@ pub struct TrackRunner {
     /// Shared information.
     pub shared: Arc<Shared>,
     /// Path to the track's log file (`<base_dir>/target/test_<track_id>.log`).
-    pub log_path: PathBuf,
+    pub log_file: File,
     /// Environment variables to set on every command in this track.
     pub env_set: Vec<(String, OsString)>,
     /// Live progress bar for this track.
@@ -90,11 +91,24 @@ impl TrackRunner {
             workspace.cargo_target_dir.clone().into(),
         )];
 
+        let mut log_file = File::create(&log_path)?;
+
+        let log_path_name = log_path.display();
+        writeln!(
+            log_file,
+            r#"################################################################################
+### Log for {display_name}
+### This file is meant to be output to a terminal, so it still contains escape
+### sequences for coloring. If you want to read the log, use
+###     tail -n +6 "{log_path_name}"
+################################################################################"#
+        )?;
+
         Ok(Self {
             display_name,
             workspace,
             shared,
-            log_path,
+            log_file,
             env_set,
             pb,
             commands: Vec::new(),
@@ -139,15 +153,13 @@ impl TrackRunner {
 
         self.pb.set_message(format!("Running {cmd_str}"));
 
-        let mut log_file = fs_err::File::create(&self.log_path)?;
-        let log_path_name = self.log_path.display();
+        let mut log_file = &self.log_file;
+
         writeln!(
             log_file,
-            r#"################################################################################
-### Log for {cmd_str}
-### This file is meant to be output to a terminal, so it still contains escape
-### sequences for coloring. If you want to read the log, use
-###     tail -n +7 "{log_path_name}"
+            r#"
+################################################################################
+### Command: {cmd_str}
 ################################################################################"#
         )?;
 
