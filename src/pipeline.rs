@@ -211,7 +211,7 @@ fn verify_required_executables() -> Result<()> {
 
 fn setup_instructions(config: &Config) -> Vec<Instruction> {
     vec![
-        cmd!(rustup "update"; "rustup update"),
+        cmd!(rustup "update" "--no-self-update"; "rustup update"), // We can't self-update from inside a cargo subcommand
         cmd!(rustup "install" "stable" "nightly" {&config.msrv}; "rustup install"),
         cmd![rustup "component" "add" "--toolchain" "stable" "rustfmt" "rust-src" "llvm-tools-preview"; "add stable components"],
         cmd![rustup "component" "add" "--toolchain" "nightly" "clippy" "rust-src" "llvm-tools-preview"; "add nightly components"],
