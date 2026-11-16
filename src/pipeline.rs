@@ -45,9 +45,9 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
 
     let err_span_check_instructions = config.err_span_check_test.as_ref().map(|test_name| [
         set!(ERR_SPAN_CHECK = if config.args.frozen { "frozen" } else { "update" }),
-        cmd!(coverage +stable test_name "--" "--ignored"; "err_stable"; "err_span_check stable"),
+        cmd!(coverage +stable "--workspace" test_name "--" "--ignored"; "err_stable"; "err_span_check stable"),
         set!(ERR_SPAN_CHECK_SPLIT_ON_CHANGE = "true"),
-        cmd!(coverage +nightly test_name "--" "--ignored"; "err_nightly"; "err_span_check nightly"),
+        cmd!(coverage +nightly "--workspace" test_name "--" "--ignored"; "err_nightly"; "err_span_check nightly"),
     ]);
 
     let msrv_setup = {
