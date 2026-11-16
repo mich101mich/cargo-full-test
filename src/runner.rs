@@ -4,7 +4,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::PathBuf,
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use ansi_str::AnsiStr;
@@ -28,10 +28,6 @@ pub struct Shared {
     pub cov_base_dir: PathBuf,
     /// Multi-progress indicator for displaying live progress bars.
     pub multi_progress: indicatif::MultiProgress,
-    /// Mutex for synchronizing fetch operations.
-    ///
-    /// Cargo locks the package registry in a way that deadlocks between MSRV and current cargo.
-    pub fetch_mutex: Mutex<()>,
 }
 
 /// Execution context for a single track (e.g. `Setup`, `Base`, `MSRV`, `MinVersions`).
@@ -49,6 +45,10 @@ pub struct TrackRunner {
     pub env_set: Vec<(String, OsString)>,
     /// Live progress bar for this track.
     pub pb: ProgressBar,
+    /// Setup instructions for this track.
+    pub setup: Vec<Instruction>,
+    /// Main instructions for this track.
+    pub instructions: Vec<Instruction>,
     /// Commands that were executed in this track.
     pub commands: Vec<String>,
     /// Output of a failed command, if any.
@@ -65,10 +65,10 @@ pub struct RunResult {
     /// Coverage output files generated during the run.
     pub coverage_reports: Vec<Report>,
 }
-impl RunResult {
-    pub fn and_assign(&mut self, other: RunResult) {
-        self.success &= other.success;
-        self.coverage_reports.extend(other.coverage_reports);
+impl std::ops::BitAndAssign for RunResult {
+    fn bitand_assign(&mut self, rhs: Self) {
+        self.success &= rhs.success;
+        self.coverage_reports.extend(rhs.coverage_reports);
     }
 }
 
@@ -79,6 +79,8 @@ impl TrackRunner {
         display_name: impl Into<Cow<'static, str>>,
         shared: Arc<Shared>,
         workspace: Workspace,
+        setup: impl Into<Vec<Instruction>>,
+        instructions: impl Into<Vec<Instruction>>,
     ) -> Result<Self> {
         fs_err::create_dir_all(&shared.log_dir)?;
         let log_path = shared.log_dir.join(format!("test_{track_id}.log"));
@@ -104,6 +106,16 @@ impl TrackRunner {
 ################################################################################"#
         )?;
 
+        let setup = setup.into();
+        let instructions = instructions.into();
+
+        let total_commands = setup
+            .iter()
+            .chain(instructions.iter())
+            .filter(|i| i.runs_command())
+            .count();
+        pb.set_length(total_commands as u64);
+
         Ok(Self {
             display_name,
             workspace,
@@ -111,6 +123,8 @@ impl TrackRunner {
             log_file,
             env_set,
             pb,
+            setup,
+            instructions,
             commands: Vec::new(),
             failed_output: None,
             coverage_reports: Vec::new(),
@@ -249,27 +263,31 @@ impl TrackRunner {
         });
     }
 
-    pub(crate) fn run_instructions(
-        mut self,
-        instructions: impl Into<Vec<Instruction>>,
-    ) -> Result<RunResult> {
-        let instructions = instructions.into();
-        let total_commands = instructions.iter().filter(|i| i.runs_command()).count();
-        self.pb.set_length(total_commands as u64);
+    pub(crate) fn run_setup(&mut self) -> Result<RunResult> {
+        let instructions = std::mem::take(&mut self.setup);
+        let success = self.run_instructions_internal(instructions)?;
+        Ok(RunResult {
+            success,
+            coverage_reports: vec![],
+        })
+    }
 
-        let mut commands_run = 0;
-        self.pb.set_position(commands_run as u64);
+    pub(crate) fn run_instructions(mut self) -> Result<RunResult> {
+        let instructions = std::mem::take(&mut self.instructions);
+        let success = self.run_instructions_internal(instructions)?;
 
-        let shared = Arc::clone(&self.shared);
-        let mut lock = None;
+        self.print_summary();
 
+        Ok(RunResult {
+            success,
+            coverage_reports: self.coverage_reports,
+        })
+    }
+
+    fn run_instructions_internal(&mut self, instructions: Vec<Instruction>) -> Result<bool> {
+        self.pb.set_position(self.commands.len() as u64);
         let mut success = true;
-
         for instruction in instructions {
-            if instruction.runs_command() {
-                commands_run += 1;
-            }
-
             match instruction {
                 Instruction::Command {
                     description,
@@ -307,23 +325,10 @@ impl TrackRunner {
                 Instruction::SetEnv { key, value } => {
                     self.set_env(key, value);
                 }
-                Instruction::TakeMutex => {
-                    self.pb.set_message("Waiting for global fetch lock");
-                    lock = Some(shared.fetch_mutex.lock().unwrap());
-                }
-                Instruction::ReleaseMutex => {
-                    drop(lock.take());
-                }
             }
 
-            self.pb.set_position(commands_run as u64);
+            self.pb.set_position(self.commands.len() as u64);
         }
-
-        self.print_summary();
-
-        Ok(RunResult {
-            success,
-            coverage_reports: self.coverage_reports,
-        })
+        Ok(success)
     }
 }

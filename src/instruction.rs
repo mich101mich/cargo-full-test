@@ -33,12 +33,13 @@ macro_rules! cmd {
 pub(crate) use cmd;
 
 macro_rules! set {
-    ( $key:ident = $value:literal ) => {
+    ( $key:ident = $value:expr ) => {
         Instruction::set_env(stringify!($key), $value)
     };
 }
 pub(crate) use set;
 
+#[derive(Debug)]
 pub enum Instruction {
     Command {
         description: &'static str,
@@ -55,8 +56,6 @@ pub enum Instruction {
         key: &'static str,
         value: &'static str,
     },
-    TakeMutex,
-    ReleaseMutex,
 }
 impl Instruction {
     pub fn command(description: &'static str, program: &'static str, args: Args) -> Self {
@@ -88,10 +87,12 @@ impl Instruction {
     }
 }
 
+#[derive(Debug)]
 pub enum Arg {
     Str(Cow<'static, str>),
     Path(PathBuf),
 }
+#[derive(Debug)]
 pub struct Args(pub Vec<Arg>);
 
 pub enum ArgLike {

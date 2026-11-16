@@ -9,7 +9,7 @@ use lcov::Report;
 
 use crate::{
     config::{Config, TestType},
-    instruction::{Instruction, args, cmd, set},
+    instruction::*,
     runner::{Shared, TrackRunner},
     workspace::Workspace,
 };
@@ -17,6 +17,72 @@ use crate::{
 /// Runs the full test pipeline (Setup -> Parallel Base / MSRV / Minimal-Versions -> Summary).
 pub fn run_pipeline(config: &Config) -> Result<()> {
     let start_time = Instant::now();
+
+    // Step 1: Declare instructions
+    let setup_instructions = [
+        cmd!(rustup "update" "--no-self-update"; "rustup update"), // We can't self-update from inside a cargo subcommand
+        cmd!(rustup "install" "--no-self-update" "stable" "nightly" {&config.msrv}; "rustup install"),
+        cmd!(rustup "component" "add" "--toolchain" "stable" "rustfmt" "rust-src" "llvm-tools-preview"; "add stable components"),
+        cmd!(rustup "component" "add" "--toolchain" "nightly" "clippy" "rust-src" "llvm-tools-preview"; "add nightly components"),
+        cmd!(cargo +stable "install" "cargo-llvm-cov"; "install cargo-llvm-cov"),
+    ];
+
+    let base_setup = vec![
+        set!(CARGO_BUILD_WARNINGS = "deny"),
+        set!(RUSTDOCFLAGS = "-D warnings"),
+        cmd!(cargo +stable "update"; "cargo update"),
+        cmd!(cargo +stable "fetch"; "cargo fetch"),
+        set!(CARGO_NET_OFFLINE = "true"),
+    ];
+
+    let base_instructions = [
+        cmd!(cargo +stable "test" "--workspace"; "stable test"),
+        cmd!(coverage +nightly "--workspace"; "nightly"; "nightly test coverage"),
+        cmd!(cargo +nightly "doc" "--no-deps" "--workspace"; "doc"),
+        cmd!(cargo +nightly "clippy" "--workspace" "--" "-D" "warnings"; "clippy"),
+        cmd!(cargo +stable "fmt" "--check" "--all"; "check fmt"),
+    ];
+
+    let err_span_check_instructions = config.err_span_check_test.as_ref().map(|test_name| [
+        set!(ERR_SPAN_CHECK = if config.args.frozen { "frozen" } else { "update" }),
+        cmd!(coverage +stable test_name "--" "--ignored"; "err_stable"; "err_span_check stable"),
+        set!(ERR_SPAN_CHECK_SPLIT_ON_CHANGE = "true"),
+        cmd!(coverage +nightly test_name "--" "--ignored"; "err_nightly"; "err_span_check nightly"),
+    ]);
+
+    let msrv_setup = {
+        let mut setup = vec![
+            set!(RUSTFLAGS = "-D warnings"), // MSRV might not have CARGO_BUILD_WARNINGS yet
+            cmd!(cargo +{config.msrv} "update"; "cargo update"),
+        ];
+
+        setup.extend(config.msrv_overrides.iter().map(
+            |ovr| cmd!(cargo +{config.msrv} "update" "--package" {&ovr.package} "--precise" {&ovr.version}; "msrv override update"),
+        ));
+
+        setup.extend([
+            cmd!(cargo +{config.msrv} "fetch"; "cargo fetch"),
+            set!(CARGO_NET_OFFLINE = "true"),
+        ]);
+
+        setup
+    };
+
+    let msrv_instructions = [cmd!(cargo +{config.msrv} "test" "--workspace"; "msrv test")];
+
+    let min_versions_setup = [
+        set!(CARGO_BUILD_WARNINGS = "deny"),
+        cmd!(cargo +nightly "-Z" "minimal-versions" "update"; "minimal-versions update"),
+        cmd!(cargo +stable "fetch"; "cargo fetch"),
+        set!(CARGO_NET_OFFLINE = "true"), // we can set this now that fetch is complete
+    ];
+
+    let min_versions_instructions = [
+        cmd!(cargo +stable "test" "--workspace"; "stable test"),
+        cmd!(cargo +nightly "test" "--workspace"; "nightly test"),
+    ];
+
+    // Step 2: Run global setup
 
     verify_required_executables()?;
 
@@ -31,19 +97,22 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
         log_dir,
         cov_base_dir,
         multi_progress: indicatif::MultiProgress::new(),
-        fetch_mutex: std::sync::Mutex::new(()),
     });
 
     let base_workspace = Workspace::new_base_dir(&config.base_dir);
 
-    // Phase 1: Pre-flight & Setup (Sequential)
     let setup_runner = TrackRunner::new(
         "setup",
         "Setup",
         Arc::clone(&shared),
         base_workspace.clone(),
+        [],
+        setup_instructions,
     )?;
-    let mut result = setup_runner.run_instructions(setup_instructions(config))?;
+
+    let mut result = setup_runner.run_instructions()?;
+
+    // Step 3: Create workspaces and runners
 
     let msrv_dir_name = format!("msrv_{}", config.msrv);
 
@@ -64,65 +133,118 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
     let msrv_workspace = Workspace::new_isolated(&config.base_dir, &msrv_dir_name)?;
     let min_versions_workspace = Workspace::new_isolated(&config.base_dir, "min_versions")?;
 
-    // Phase 2: Parallel Test Tracks
-    let base_runner = TrackRunner::new("base", "Base", Arc::clone(&shared), base_workspace)?;
-    let base_instructions = base_track(config);
+    let (base_setup, err_span_check_setup) = if config.should_run(TestType::Base) {
+        (base_setup, vec![]) // base runner runs first and runs the setup
+    } else {
+        (vec![], base_setup) // base setup is run by err_span_check_runner if needed
+    };
 
-    let msrv_runner = TrackRunner::new(
-        "msrv",
-        format!("MSRV {}", config.msrv),
-        Arc::clone(&shared),
-        msrv_workspace,
-    )?;
-    let msrv_instructions = msrv_track(config);
+    let mut base_runner = if config.should_run(TestType::Base) {
+        Some(TrackRunner::new(
+            "base",
+            "Base",
+            Arc::clone(&shared),
+            base_workspace.clone(),
+            base_setup,
+            base_instructions,
+        )?)
+    } else {
+        None
+    };
 
-    let min_versions_runner = TrackRunner::new(
-        "min_versions",
-        "MinVersions",
-        Arc::clone(&shared),
-        min_versions_workspace,
-    )?;
-    let min_versions_instructions = min_versions_track(config);
+    let mut msrv_runner = if config.should_run(TestType::Msrv) {
+        Some(TrackRunner::new(
+            "msrv",
+            format!("MSRV {}", config.msrv),
+            Arc::clone(&shared),
+            msrv_workspace,
+            msrv_setup,
+            msrv_instructions,
+        )?)
+    } else {
+        None
+    };
 
+    let mut min_versions_runner = if config.should_run(TestType::MinVersions) {
+        Some(TrackRunner::new(
+            "min_versions",
+            "MinVersions",
+            Arc::clone(&shared),
+            min_versions_workspace,
+            min_versions_setup,
+            min_versions_instructions,
+        )?)
+    } else {
+        None
+    };
+
+    let mut err_span_check_runner = if config.should_run(TestType::ErrSpanCheck)
+        && let Some(instructions) = err_span_check_instructions
+    {
+        Some(TrackRunner::new(
+            "err_span_check",
+            "ErrSpanCheck",
+            Arc::clone(&shared),
+            base_workspace,
+            err_span_check_setup,
+            instructions,
+        )?)
+    } else {
+        None
+    };
+
+    // Step 4: Run setup instructions sequentially
+    for runner in [
+        base_runner.as_mut(),
+        msrv_runner.as_mut(),
+        min_versions_runner.as_mut(),
+        err_span_check_runner.as_mut(),
+    ] {
+        if result.success
+            && let Some(runner) = runner
+        {
+            result &= runner.run_setup()?;
+        }
+    }
+
+    // Step 5: Run main instructions in parallel
     if result.success {
         std::thread::scope(|s| -> Result<()> {
-            let should_run_base =
-                config.should_run(TestType::Base) || config.should_run(TestType::ErrSpanCheck);
-            let base = should_run_base
-                .then(|| s.spawn(|| base_runner.run_instructions(base_instructions)));
+            let handles = [base_runner, msrv_runner, min_versions_runner]
+                .into_iter()
+                .flatten()
+                .map(|runner| s.spawn(|| runner.run_instructions()))
+                .collect::<Vec<_>>();
 
-            let msrv = config
-                .should_run(TestType::Msrv)
-                .then(|| s.spawn(|| msrv_runner.run_instructions(msrv_instructions)));
-
-            let min_versions = config.should_run(TestType::MinVersions).then(|| {
-                s.spawn(|| min_versions_runner.run_instructions(min_versions_instructions))
-            });
-
-            if let Some(base) = base {
-                result.and_assign(base.join().expect("Failed to join thread")?);
-            }
-            if let Some(msrv) = msrv {
-                result.and_assign(msrv.join().expect("Failed to join thread")?);
-            }
-            if let Some(min_versions) = min_versions {
-                result.and_assign(min_versions.join().expect("Failed to join thread")?);
+            for handle in handles {
+                result &= handle.join().expect("Failed to join thread")?;
             }
             Ok(())
         })?;
     }
 
-    // Phase 3: Completion Summary
+    // Step 6: Run ErrSpanCheck instructions if applicable
+    if result.success
+        && let Some(err_span_check_runner) = err_span_check_runner
+    {
+        result &= err_span_check_runner.run_instructions()?;
+    }
+
+    // Step 7: Completion Summary
     let elapsed = start_time.elapsed().as_secs();
     if result.success {
-        let scope = if config.has_only() { "Selected" } else { "All" };
+        let scope = if config.has_track_selection() {
+            "Selected"
+        } else {
+            "All"
+        };
         println!("{scope} tests passed in {elapsed} seconds!");
     } else {
         println!("Full-test unsuccessful in {elapsed} seconds!");
     }
 
     if !result.coverage_reports.is_empty() {
-        // Phase 4: Coverage Report
+        // Step 8: Coverage Report
         let mut report = Report::new();
         for part_report in result.coverage_reports {
             report
@@ -207,86 +329,4 @@ fn verify_required_executables() -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn setup_instructions(config: &Config) -> Vec<Instruction> {
-    vec![
-        cmd!(rustup "update" "--no-self-update"; "rustup update"), // We can't self-update from inside a cargo subcommand
-        cmd!(rustup "install" "stable" "nightly" {&config.msrv}; "rustup install"),
-        cmd![rustup "component" "add" "--toolchain" "stable" "rustfmt" "rust-src" "llvm-tools-preview"; "add stable components"],
-        cmd![rustup "component" "add" "--toolchain" "nightly" "clippy" "rust-src" "llvm-tools-preview"; "add nightly components"],
-        cmd!(cargo +stable "install" "cargo-llvm-cov"; "install cargo-llvm-cov"),
-    ]
-}
-
-fn base_track(config: &Config) -> Vec<Instruction> {
-    let mut instructions = vec![
-        set!(CARGO_BUILD_WARNINGS = "deny"),
-        set!(RUSTDOCFLAGS = "-D warnings"),
-        Instruction::TakeMutex,
-        cmd!(cargo +stable "update"; "cargo update"),
-        cmd!(cargo +stable "fetch"; "cargo fetch"),
-        Instruction::ReleaseMutex,
-        set!(CARGO_NET_OFFLINE = "true"),
-    ];
-
-    if config.should_run(TestType::Base) {
-        instructions.extend([
-            cmd!(cargo +stable "test" "--workspace"; "stable test"),
-            cmd!(coverage +nightly "--workspace"; "nightly"; "nightly test coverage"),
-            cmd!(cargo +nightly "doc" "--no-deps" "--workspace"; "doc"),
-            cmd!(cargo +nightly "clippy" "--workspace" "--" "-D" "warnings"; "clippy"),
-            cmd!(cargo +stable "fmt" "--check" "--all"; "check fmt"),
-        ]);
-    }
-
-    if config.should_run(TestType::ErrSpanCheck)
-        && let Some(test_name) = &config.err_span_check_test
-    {
-        if config.args.frozen {
-            instructions.push(set!(ERR_SPAN_CHECK = "frozen"));
-        }
-
-        instructions.extend([
-            cmd!(coverage +stable test_name "--" "--ignored"; "err_stable"; "err_span_check stable"),
-            set!(ERR_SPAN_CHECK_SPLIT_ON_CHANGE = "true"),
-            cmd!(coverage +nightly test_name "--" "--ignored"; "err_nightly"; "err_span_check nightly"),
-        ]);
-    }
-
-    instructions
-}
-
-fn msrv_track(config: &Config) -> Vec<Instruction> {
-    let mut instructions = vec![
-        set!(RUSTFLAGS = "-D warnings"), // MSRV might not have CARGO_BUILD_WARNINGS yet
-        Instruction::TakeMutex,
-        cmd!(cargo +{config.msrv} "update"; "cargo update"),
-    ];
-
-    instructions.extend(config.msrv_overrides.iter().map(
-        |ovr| cmd!(cargo +{config.msrv} "update" "--package" {&ovr.package} "--precise" {&ovr.version}; "msrv override update"),
-    ));
-
-    instructions.extend([
-        cmd!(cargo +{config.msrv} "fetch"; "cargo fetch"),
-        Instruction::ReleaseMutex,
-        set!(CARGO_NET_OFFLINE = "true"),
-        cmd!(cargo +{config.msrv} "test" "--workspace"; "msrv test"),
-    ]);
-
-    instructions
-}
-
-fn min_versions_track(_config: &Config) -> Vec<Instruction> {
-    vec![
-        set!(CARGO_BUILD_WARNINGS = "deny"),
-        Instruction::TakeMutex,
-        cmd!(cargo +nightly "-Z" "minimal-versions" "update"; "minimal-versions update"),
-        cmd!(cargo +stable "fetch"; "cargo fetch"),
-        Instruction::ReleaseMutex,
-        set!(CARGO_NET_OFFLINE = "true"), // we can set this now that fetch is complete
-        cmd!(cargo +stable "test" "--workspace"; "stable test"),
-        cmd!(cargo +nightly "test" "--workspace"; "nightly test"),
-    ]
 }

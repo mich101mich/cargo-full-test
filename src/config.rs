@@ -81,22 +81,22 @@ impl Config {
         Self::from_metadata(&metadata, args)
     }
 
-    pub fn has_only(&self) -> bool {
-        self.args.only_base
-            || self.args.only_msrv
-            || self.args.only_min_versions
-            || self.args.only_err_span_check
+    pub fn has_track_selection(&self) -> bool {
+        self.args.track.base
+            || self.args.track.msrv
+            || self.args.track.min_versions
+            || self.args.track.err_span_check
     }
 
     pub fn should_run(&self, test_type: TestType) -> bool {
-        if !self.has_only() {
+        if !self.has_track_selection() {
             return true;
         }
         match test_type {
-            TestType::Base => self.args.only_base,
-            TestType::Msrv => self.args.only_msrv,
-            TestType::MinVersions => self.args.only_min_versions,
-            TestType::ErrSpanCheck => self.args.only_err_span_check,
+            TestType::Base => self.args.track.base,
+            TestType::Msrv => self.args.track.msrv,
+            TestType::MinVersions => self.args.track.min_versions,
+            TestType::ErrSpanCheck => self.args.track.err_span_check,
         }
     }
 

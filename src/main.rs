@@ -37,21 +37,27 @@ pub struct CliArgs {
     #[arg(long)]
     pub frozen: bool,
 
-    /// Only run the base tests
-    #[arg(long, short)]
-    pub only_base: bool,
+    #[command(flatten, next_help_heading = "Track Selection")]
+    pub track: TrackSelectionArgs,
+}
 
-    /// Only run MSRV tests
-    #[arg(long, short)]
-    pub only_msrv: bool,
+#[derive(Debug, Parser)]
+pub struct TrackSelectionArgs {
+    /// Run the tests from the base track (enabled by default, unless other tracks are specified)
+    #[arg(long)]
+    pub base: bool,
 
-    /// Only run minimal-versions tests
-    #[arg(long, short, alias = "only-mv")]
-    pub only_min_versions: bool,
+    /// Run tests from the MSRV track (enabled by default, unless other tracks are specified)
+    #[arg(long)]
+    pub msrv: bool,
 
-    /// Only run err-span-check tests
-    #[arg(long, short)]
-    pub only_err_span_check: bool,
+    /// Run tests from the minimal-versions track (enabled by default, unless other tracks are specified)
+    #[arg(long, alias = "mv")]
+    pub min_versions: bool,
+
+    /// Run tests from the err-span-check track (enabled by default, unless other tracks are specified)
+    #[arg(long)]
+    pub err_span_check: bool,
 }
 
 impl CliArgs {

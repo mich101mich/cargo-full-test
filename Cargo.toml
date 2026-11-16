@@ -2,6 +2,7 @@
 name = "cargo-full-test"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88.0"
 description = "Full test, lint, coverage, MSRV, and minimal-versions runner"
 
 [dependencies]
