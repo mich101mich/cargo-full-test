@@ -1,0 +1,215 @@
+use std::{borrow::Cow, ffi::OsStr, path::PathBuf};
+
+macro_rules! args {
+    ( $( $arg:expr )* ) => {
+        {
+            let mut args = crate::instruction::Args(Vec::new());
+            $(
+                #[allow(unused_braces)]
+                args.append($arg);
+            )*
+            args
+        }
+    };
+}
+pub(crate) use args;
+
+macro_rules! cmd {
+    ( cargo +$toolchain:ident $( $arg:expr )* ; $description:expr ) => {
+        crate::instruction::Instruction::command($description, "cargo", crate::instruction::args!(concat!("+", stringify!($toolchain)) $( $arg )* ))
+    };
+    ( cargo +{$version:expr} $( $arg:expr )* ; $description:expr ) => {
+        crate::instruction::Instruction::command($description, "cargo", crate::instruction::args!(format!("+{}", $version) $( $arg )* ))
+    };
+
+    ( rustup $( $arg:expr )* ; $description:expr ) => {
+        crate::instruction::Instruction::command($description, "rustup", crate::instruction::args!( $( $arg )* ))
+    };
+
+    ( coverage +$toolchain:ident $( $extra_arg:expr )* ; $cov_name:expr ; $name:expr ) => {
+        crate::instruction::Instruction::coverage($name, $cov_name, concat!("+", stringify!($toolchain)), crate::instruction::args!( $( $extra_arg )* ))
+    };
+}
+pub(crate) use cmd;
+
+macro_rules! set {
+    ( $key:ident = $value:expr ) => {
+        crate::instruction::Instruction::set_env(stringify!($key), $value)
+    };
+}
+pub(crate) use set;
+
+pub enum Instruction {
+    Command {
+        description: Cow<'static, str>,
+        program: &'static str,
+        args: Args,
+    },
+    Coverage {
+        name: Cow<'static, str>,
+        coverage_name: &'static str,
+        toolchain: &'static str,
+        extra_args: Args,
+    },
+    SetEnv {
+        key: &'static str,
+        value: &'static str,
+    },
+    ToolCheck {
+        name: Cow<'static, str>,
+        required: Vec<String>,
+        #[expect(clippy::type_complexity, reason = "don't know what else to do")]
+        remove_installed: Box<dyn FnOnce(&mut Vec<String>) -> anyhow::Result<()> + Send>,
+        install_command: Option<(&'static str, Args)>,
+    },
+}
+impl Instruction {
+    pub fn command(
+        description: impl Into<Cow<'static, str>>,
+        program: &'static str,
+        args: Args,
+    ) -> Self {
+        Self::Command {
+            description: description.into(),
+            program,
+            args,
+        }
+    }
+    pub fn coverage(
+        name: impl Into<Cow<'static, str>>,
+        coverage_name: &'static str,
+        toolchain: &'static str,
+        extra_args: Args,
+    ) -> Self {
+        Self::Coverage {
+            name: name.into(),
+            coverage_name,
+            toolchain,
+            extra_args,
+        }
+    }
+    pub fn set_env(key: &'static str, value: &'static str) -> Self {
+        Self::SetEnv { key, value }
+    }
+    pub fn tool_check(
+        name: impl Into<Cow<'static, str>>,
+        required: Vec<String>,
+        remove_installed: impl FnOnce(&mut Vec<String>) -> anyhow::Result<()> + Send + 'static,
+        install_command: impl Into<Option<(&'static str, Args)>>,
+    ) -> Self {
+        Self::ToolCheck {
+            name: name.into(),
+            required,
+            remove_installed: Box::new(remove_installed),
+            install_command: install_command.into(),
+        }
+    }
+
+    pub fn runs_command(&self) -> bool {
+        matches!(
+            self,
+            Self::Command { .. } | Self::Coverage { .. } | Self::ToolCheck { .. }
+        )
+    }
+}
+
+#[derive(Debug)]
+pub enum Arg {
+    Str(Cow<'static, str>),
+    Path(PathBuf),
+}
+#[derive(Debug)]
+pub struct Args(pub Vec<Arg>);
+
+pub enum ArgLike {
+    Arg(Arg),
+    Args(Args),
+}
+
+impl Args {
+    pub fn write_to(&self, s: &mut String, base_dir: &PathBuf) {
+        for arg in &self.0 {
+            s.push(' ');
+            match arg {
+                Arg::Str(st) => s.push_str(st),
+                Arg::Path(p) => {
+                    if let Ok(rel) = p.strip_prefix(base_dir) {
+                        s.push_str(&rel.to_string_lossy());
+                    } else {
+                        s.push_str(&p.to_string_lossy());
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn append(&mut self, arg: impl Into<ArgLike>) {
+        match arg.into() {
+            ArgLike::Arg(a) => self.0.push(a),
+            ArgLike::Args(args) => self.0.extend(args.0),
+        }
+    }
+}
+
+impl IntoIterator for Args {
+    type Item = Arg;
+    type IntoIter = std::vec::IntoIter<Arg>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl AsRef<OsStr> for Arg {
+    fn as_ref(&self) -> &OsStr {
+        match self {
+            Arg::Str(s) => s.as_ref().as_ref(),
+            Arg::Path(p) => p.as_os_str(),
+        }
+    }
+}
+
+impl From<&'static str> for ArgLike {
+    fn from(s: &'static str) -> Self {
+        ArgLike::Arg(Arg::Str(Cow::Borrowed(s)))
+    }
+}
+
+impl From<String> for ArgLike {
+    fn from(s: String) -> Self {
+        ArgLike::Arg(Arg::Str(Cow::Owned(s)))
+    }
+}
+
+impl<'a> From<&'a String> for ArgLike {
+    fn from(s: &'a String) -> Self {
+        ArgLike::Arg(Arg::Str(Cow::Owned(s.clone())))
+    }
+}
+impl<'a> From<Cow<'a, str>> for ArgLike {
+    fn from(s: Cow<'a, str>) -> Self {
+        ArgLike::Arg(Arg::Str(Cow::Owned(s.into())))
+    }
+}
+
+impl From<PathBuf> for ArgLike {
+    fn from(p: PathBuf) -> Self {
+        ArgLike::Arg(Arg::Path(p))
+    }
+}
+
+// to allow flattening with `..args`
+impl From<std::ops::RangeTo<Args>> for ArgLike {
+    fn from(range: std::ops::RangeTo<Args>) -> Self {
+        ArgLike::Args(range.end)
+    }
+}
+impl<T: Into<ArgLike>> From<std::ops::RangeTo<Vec<T>>> for ArgLike {
+    fn from(range: std::ops::RangeTo<Vec<T>>) -> Self {
+        let mut args = Args(vec![]);
+        for t in range.end {
+            args.append(t);
+        }
+        ArgLike::Args(args)
+    }
+}

@@ -10,8 +10,8 @@
 
 //! `cargo full-test` - Parallel full test, lint, coverage, MSRV, and minimal-versions runner.
 
-mod args;
 mod config;
+mod instruction;
 mod pipeline;
 mod runner;
 mod workspace;
@@ -24,7 +24,7 @@ use clap::Parser;
 use crate::config::Config;
 
 /// CLI arguments for `cargo full-test`.
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(
     name = "cargo-full-test",
     bin_name = "cargo full-test",
@@ -37,21 +37,31 @@ pub struct CliArgs {
     #[arg(long)]
     pub frozen: bool,
 
-    /// Only run the base tests
+    /// When asked to install required tools, automatically answer "yes" to all prompts.
     #[arg(long, short)]
-    pub only_base: bool,
+    pub yes: bool,
 
-    /// Only run MSRV tests
-    #[arg(long, short)]
-    pub only_msrv: bool,
+    #[command(flatten, next_help_heading = "Track Selection")]
+    pub track: TrackSelectionArgs,
+}
 
-    /// Only run minimal-versions tests
-    #[arg(long, short, alias = "only-mv")]
-    pub only_min_versions: bool,
+#[derive(Debug, Clone, Parser)]
+pub struct TrackSelectionArgs {
+    /// Run the tests from the base track (enabled by default, unless other tracks are specified)
+    #[arg(long)]
+    pub base: bool,
 
-    /// Only run err-span-check tests
-    #[arg(long, short)]
-    pub only_err_span_check: bool,
+    /// Run tests from the MSRV track (enabled by default, unless other tracks are specified)
+    #[arg(long)]
+    pub msrv: bool,
+
+    /// Run tests from the minimal-versions track (enabled by default, unless other tracks are specified)
+    #[arg(long, alias = "mv")]
+    pub min_versions: bool,
+
+    /// Run tests from the err-span-check track (enabled by default, unless other tracks are specified)
+    #[arg(long)]
+    pub err_span_check: bool,
 }
 
 impl CliArgs {

@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push: { branches: [master] }
+  pull_request: { branches: [master] }
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-full-test
+        run: cargo install --path .
+
+      - name: Run cargo full-test
+        run: cargo full-test --yes

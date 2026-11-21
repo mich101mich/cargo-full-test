@@ -4,36 +4,33 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::PathBuf,
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use ansi_str::AnsiStr;
 use anyhow::{Context, Result};
+use fs_err::File;
 use indicatif::{ProgressBar, ProgressStyle};
+use lcov::Report;
 
 use crate::{
-    args::{Args, Instruction},
+    instruction::{Args, Instruction, args},
     workspace::Workspace,
 };
 
 #[derive(Debug)]
 pub struct Shared {
-    /// Base directory of the project.
-    pub base_dir: PathBuf,
+    /// The configuration of the full test suite.
+    pub config: crate::config::Config,
     /// Directory for storing log files.
     pub log_dir: PathBuf,
     /// Directory for storing coverage output.
     pub cov_base_dir: PathBuf,
     /// Multi-progress indicator for displaying live progress bars.
     pub multi_progress: indicatif::MultiProgress,
-    /// Mutex for synchronizing fetch operations.
-    ///
-    /// Cargo locks the package registry in a way that deadlocks between MSRV and current cargo.
-    pub fetch_mutex: Mutex<()>,
 }
 
 /// Execution context for a single track (e.g. `Setup`, `Base`, `MSRV`, `MinVersions`).
-#[derive(Debug)]
 pub struct TrackRunner {
     /// Display name for the track (e.g., `"Base"`).
     pub display_name: Cow<'static, str>,
@@ -42,15 +39,44 @@ pub struct TrackRunner {
     /// Shared information.
     pub shared: Arc<Shared>,
     /// Path to the track's log file (`<base_dir>/target/test_<track_id>.log`).
-    pub log_path: PathBuf,
+    pub log_file: File,
     /// Environment variables to set on every command in this track.
     pub env_set: Vec<(String, OsString)>,
     /// Live progress bar for this track.
     pub pb: ProgressBar,
+    /// Setup instructions for this track.
+    pub setup: Vec<Instruction>,
+    /// Main instructions for this track.
+    pub instructions: Vec<Instruction>,
     /// Commands that were executed in this track.
     pub commands: Vec<String>,
     /// Output of a failed command, if any.
     pub failed_output: Option<String>,
+    /// Coverage output files from this track.
+    pub coverage_reports: Vec<Report>,
+}
+
+/// Result of executing a track
+#[derive(Debug)]
+pub struct RunResult {
+    /// Indicates whether the run was successful.
+    pub success: bool,
+    /// Coverage output files generated during the run.
+    pub coverage_reports: Vec<Report>,
+}
+impl std::ops::BitAndAssign for RunResult {
+    fn bitand_assign(&mut self, rhs: Self) {
+        self.success &= rhs.success;
+        self.coverage_reports.extend(rhs.coverage_reports);
+    }
+}
+impl Default for RunResult {
+    fn default() -> Self {
+        Self {
+            success: true,
+            coverage_reports: Vec::new(),
+        }
+    }
 }
 
 impl TrackRunner {
@@ -60,6 +86,8 @@ impl TrackRunner {
         display_name: impl Into<Cow<'static, str>>,
         shared: Arc<Shared>,
         workspace: Workspace,
+        setup: impl Into<Vec<Instruction>>,
+        instructions: impl Into<Vec<Instruction>>,
     ) -> Result<Self> {
         fs_err::create_dir_all(&shared.log_dir)?;
         let log_path = shared.log_dir.join(format!("test_{track_id}.log"));
@@ -72,15 +100,41 @@ impl TrackRunner {
             workspace.cargo_target_dir.clone().into(),
         )];
 
+        let mut log_file = File::create(&log_path)?;
+
+        let log_path_name = log_path.display();
+        writeln!(
+            log_file,
+            r#"################################################################################
+### Log for {display_name}
+### This file is meant to be output to a terminal, so it still contains escape
+### sequences for coloring. If you want to read the log, use
+###     tail -n +6 "{log_path_name}"
+################################################################################"#
+        )?;
+
+        let setup = setup.into();
+        let instructions = instructions.into();
+
+        let total_commands = setup
+            .iter()
+            .chain(instructions.iter())
+            .filter(|i| i.runs_command())
+            .count();
+        pb.set_length(total_commands as u64);
+
         Ok(Self {
             display_name,
             workspace,
             shared,
-            log_path,
+            log_file,
             env_set,
             pb,
+            setup,
+            instructions,
             commands: Vec::new(),
             failed_output: None,
+            coverage_reports: Vec::new(),
         })
     }
 
@@ -100,7 +154,7 @@ impl TrackRunner {
     }
 
     /// Sets an environment variable for commands in this track.
-    pub fn set_env(&mut self, key: impl Into<String>, val: impl Into<OsString>) {
+    fn set_env(&mut self, key: impl Into<String>, val: impl Into<OsString>) {
         let key = key.into();
         let val = val.into();
         if let Some((_, existing)) = self.env_set.iter_mut().find(|(k, _)| k == &key) {
@@ -112,23 +166,21 @@ impl TrackRunner {
 
     /// Runs a command in this track's working directory, logging raw output to `self.log_path`
     /// and updating the live spinner with the most recent output line.
-    pub fn run_cmd(&mut self, description: &str, program: &str, args: Args) -> Result<bool> {
+    fn run_cmd(&mut self, description: &str, program: &str, args: Args) -> Result<bool> {
         let mut cmd_str = program.to_owned();
-        args.write_to(&mut cmd_str, &self.shared.base_dir);
+        args.write_to(&mut cmd_str, &self.shared.config.base_dir);
 
         self.commands.push(cmd_str.clone());
 
         self.pb.set_message(format!("Running {cmd_str}"));
 
-        let mut log_file = fs_err::File::create(&self.log_path)?;
-        let log_path_name = self.log_path.display();
+        let mut log_file = &self.log_file;
+
         writeln!(
             log_file,
-            r#"################################################################################
-### Log for {cmd_str}
-### This file is meant to be output to a terminal, so it still contains escape
-### sequences for coloring. If you want to read the log, use
-###     tail -n +7 "{log_path_name}"
+            r#"
+################################################################################
+### Command: {cmd_str}
 ################################################################################"#
         )?;
 
@@ -195,7 +247,7 @@ impl TrackRunner {
         Ok(true)
     }
 
-    pub fn print_summary(self) {
+    pub(crate) fn print_summary(&self) {
         self.pb.finish_and_clear();
 
         self.pb.suspend(|| {
@@ -218,53 +270,131 @@ impl TrackRunner {
         });
     }
 
-    pub(crate) fn run_instructions(
-        mut self,
-        instructions: impl Into<Vec<Instruction>>,
-    ) -> Result<bool> {
-        let instructions = instructions.into();
-        let total_commands = instructions
-            .iter()
-            .filter(|i| matches!(i, Instruction::Command { .. }))
-            .count();
-        self.pb.set_length(total_commands as u64);
+    pub(crate) fn run_setup(&mut self) -> Result<RunResult> {
+        let instructions = std::mem::take(&mut self.setup);
+        let success = self.run_instructions_internal(instructions)?;
+        Ok(RunResult {
+            success,
+            coverage_reports: vec![],
+        })
+    }
 
-        let mut commands_run = 0;
-        self.pb.set_position(commands_run as u64);
-
-        let shared = Arc::clone(&self.shared);
-        let mut lock = None;
-
-        let mut result = true;
-
-        for instruction in instructions {
-            match instruction {
-                Instruction::Command {
-                    description,
-                    program,
-                    args,
-                } => {
-                    if !self.run_cmd(description, program, args)? {
-                        result = false;
-                    }
-                    commands_run += 1;
-                    self.pb.set_position(commands_run as u64);
-                }
-                Instruction::SetEnv { key, value } => {
-                    self.set_env(key, value);
-                }
-                Instruction::TakeMutex => {
-                    self.pb.set_message("Waiting for global fetch lock");
-                    lock = Some(shared.fetch_mutex.lock().unwrap());
-                }
-                Instruction::ReleaseMutex => {
-                    drop(lock.take());
-                }
-            }
-        }
+    pub(crate) fn run_instructions(mut self) -> Result<RunResult> {
+        let instructions = std::mem::take(&mut self.instructions);
+        let success = self.run_instructions_internal(instructions)?;
 
         self.print_summary();
 
-        Ok(result)
+        Ok(RunResult {
+            success,
+            coverage_reports: self.coverage_reports,
+        })
+    }
+
+    pub(crate) fn run_one(&mut self, instruction: Instruction) -> Result<bool> {
+        match instruction {
+            Instruction::Command {
+                description,
+                program,
+                args,
+            } => {
+                return self.run_cmd(&description, program, args);
+            }
+            Instruction::Coverage {
+                name,
+                coverage_name,
+                toolchain,
+                extra_args,
+            } => {
+                if !self.shared.config.options.run_coverage {
+                    // Fall back to just running the tests without coverage
+                    let description = format!("{name} tests");
+                    let args = args!("test" {..extra_args});
+                    return self.run_cmd(&description, "cargo", args);
+                }
+
+                let description = format!("{name} test coverage");
+
+                let coverage_dir = self.shared.cov_base_dir.join(coverage_name);
+                fs_err::create_dir_all(&coverage_dir)?;
+
+                let coverage_file = coverage_dir.join("lcov.info");
+
+                let args = args!(toolchain "llvm-cov" "test" "--lcov" "--output-path" {coverage_file.clone()} {..extra_args});
+
+                if !self.run_cmd(&description, "cargo", args)? {
+                    return Ok(false);
+                }
+
+                let report =
+                    Report::from_file(&coverage_file).context("Failed to read coverage report")?;
+
+                self.coverage_reports.push(report);
+            }
+            Instruction::SetEnv { key, value } => {
+                self.set_env(key, value);
+            }
+            Instruction::ToolCheck {
+                name,
+                mut required,
+                remove_installed,
+                install_command,
+            } => {
+                self.pb.set_message(format!("Checking required {name}"));
+
+                let success_name = format!("check required {name}: {required:?}");
+
+                remove_installed(&mut required)?;
+
+                if required.is_empty() {
+                    self.commands.push(success_name);
+                    return Ok(true);
+                }
+
+                let Some((program, mut args)) = install_command else {
+                    self.failed_output = Some(format!(
+                        "Missing required {name}: {required:?}. Please install them."
+                    ));
+                    return Ok(false);
+                };
+
+                let confirmed = self.shared.config.args.yes
+                    || self.pb.suspend(|| {
+                        println!(
+                            "The following {name} are required but not installed: {required:?}"
+                        );
+                        dialoguer::Confirm::new()
+                            .with_prompt("Install now?")
+                            .default(true)
+                            .interact_opt()
+                            .map(|opt| opt.unwrap_or(false))
+                    })?;
+
+                if !confirmed {
+                    self.failed_output = Some(format!(
+                        "Required {name} not installed. Please install them manually: {required:?}"
+                    ));
+                    return Ok(false);
+                }
+
+                args.append(..required);
+                return self.run_cmd(&format!("Install required {name}"), program, args);
+            }
+        }
+
+        Ok(true)
+    }
+
+    fn run_instructions_internal(&mut self, instructions: Vec<Instruction>) -> Result<bool> {
+        self.pb.set_position(self.commands.len() as u64);
+        let mut success = true;
+        for instruction in instructions {
+            if !self.run_one(instruction)? {
+                success = false;
+                break;
+            }
+            self.pb.set_position(self.commands.len() as u64);
+        }
+        Ok(success)
     }
 }
