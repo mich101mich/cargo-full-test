@@ -24,7 +24,7 @@ use clap::Parser;
 use crate::config::Config;
 
 /// CLI arguments for `cargo full-test`.
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(
     name = "cargo-full-test",
     bin_name = "cargo full-test",
@@ -37,11 +37,15 @@ pub struct CliArgs {
     #[arg(long)]
     pub frozen: bool,
 
+    /// When asked to install required tools, automatically answer "yes" to all prompts.
+    #[arg(long, short)]
+    pub yes: bool,
+
     #[command(flatten, next_help_heading = "Track Selection")]
     pub track: TrackSelectionArgs,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 pub struct TrackSelectionArgs {
     /// Run the tests from the base track (enabled by default, unless other tracks are specified)
     #[arg(long)]

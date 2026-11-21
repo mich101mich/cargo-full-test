@@ -1,83 +1,96 @@
 use std::process::{Command, Stdio};
 
-use crate::{config::Config, instruction::cmd, runner::TrackRunner};
+use crate::{
+    config::Config,
+    instruction::{Instruction, args},
+};
 
-use anyhow::{Result, bail};
+pub(crate) fn setup_tools(config: &Config) -> Vec<Instruction> {
+    let mut toolchains = vec!["stable", &config.msrv];
+    toolchains.extend(config.options.extra_toolchains.iter().map(|s| s.as_str()));
+    toolchains.sort_unstable();
+    toolchains.dedup();
 
-pub(crate) fn setup_tools(config: &Config, runner: TrackRunner) -> Result<()> {
-    let mut check = ToolCheck { runner };
-    check.commands(["rustup", "cargo"])?;
-    check.toolchains(["stable", "nightly", &config.msrv])?;
-    check.components("stable", ["rustfmt", "rust-src", "llvm-tools"])?;
-    check.components("nightly", ["clippy", "rust-src", "llvm-tools"])?;
-    check.subcommands(["llvm-cov"])?;
-    check.runner.print_summary();
-    Ok(())
+    let has_nightly = toolchains.contains(&"nightly");
+
+    let mut stable_components = vec!["rustfmt"];
+    let mut nightly_components = vec![];
+    let mut subcommands = vec![];
+
+    if has_nightly {
+        nightly_components.push("clippy");
+    } else {
+        stable_components.push("clippy");
+    }
+
+    if config.options.run_coverage {
+        stable_components.push("llvm-tools");
+        nightly_components.push("llvm-tools");
+        subcommands.push("cargo-llvm-cov");
+    }
+
+    if config.options.err_span_check_test.is_some() {
+        stable_components.push("rust-src");
+        nightly_components.push("rust-src");
+    }
+
+    let mut instructions = Vec::new();
+    instructions.push(check_commands(["rustup", "cargo"]));
+    instructions.push(check_toolchains(toolchains));
+    if !stable_components.is_empty() {
+        instructions.push(check_components("stable", stable_components));
+    }
+    if has_nightly && !nightly_components.is_empty() {
+        instructions.push(check_components("nightly", nightly_components));
+    }
+    if !subcommands.is_empty() {
+        instructions.push(check_subcommands(subcommands));
+    }
+
+    instructions
 }
 
-struct ToolCheck {
-    runner: TrackRunner,
-}
-impl ToolCheck {
-    fn commands<const N: usize>(&mut self, required_commands: [&str; N]) -> Result<()> {
-        for cmd in required_commands {
+fn check_commands<'a>(required: impl IntoIterator<Item = &'a str>) -> Instruction {
+    let remove_installed = |required: &mut Vec<String>| {
+        required.retain(|cmd| {
             let installed = Command::new(cmd)
                 .arg("--version")
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
                 .is_ok_and(|s| s.success());
-
-            if !installed {
-                bail!("cargo-full-test requires command '{cmd}' in PATH. Please install it.");
-            }
-        }
+            !installed
+        });
         Ok(())
-    }
+    };
+    Instruction::tool_check("commands", to_string_vec(required), remove_installed, None)
+}
 
-    fn toolchains<const N: usize>(&mut self, required_toolchains: [&str; N]) -> Result<()> {
+fn check_toolchains<'a>(required: impl IntoIterator<Item = &'a str>) -> Instruction {
+    let remove_installed = |required: &mut Vec<String>| {
         let installed_toolchains = Command::new("rustup")
             .args(["toolchain", "list"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output()
-            .map(|output| {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                stdout
-                    .lines()
-                    .map(|line| line.to_string())
-                    .collect::<Vec<_>>()
-            })?;
-        let missing_toolchains = required_toolchains
-            .iter()
-            .filter(|toolchain| !contains_prefix(&installed_toolchains, toolchain))
-            .map(|&s| s.to_string())
-            .collect::<Vec<_>>();
-        if !missing_toolchains.is_empty() {
-            println!(
-                "The following toolchains are required but not installed: {missing_toolchains:?}"
-            );
-            if !confirm("Install them now?")? {
-                bail!(
-                    "Required toolchains not installed. Please install the following toolchains manually: {missing_toolchains:?}"
-                );
-            }
-
-            let command =
-                cmd!(rustup "install" "--no-self-update" {..missing_toolchains}; "rustup install"); // We can't self-update from inside a cargo subcommand
-            if !self.runner.run_one(command)? {
-                bail!("Failed to install missing toolchains");
-            }
-        }
-
+            .map(|output| to_string_vec(String::from_utf8_lossy(&output.stdout).lines()))?;
+        required.retain(|toolchain| !contains_prefix(&installed_toolchains, toolchain));
         Ok(())
-    }
+    };
 
-    fn components<const N: usize>(
-        &mut self,
-        toolchain: &'static str,
-        required: [&'static str; N],
-    ) -> Result<()> {
+    Instruction::tool_check(
+        "toolchains",
+        to_string_vec(required),
+        remove_installed,
+        ("rustup", args!("install" "--no-self-update")),
+    )
+}
+
+fn check_components<'a>(
+    toolchain: &'static str,
+    required: impl IntoIterator<Item = &'a str>,
+) -> Instruction {
+    let remove_installed_components = move |required: &mut Vec<String>| {
         let installed_components = Command::new("rustup")
             .args(["component", "list", "--toolchain", toolchain])
             .stdout(Stdio::piped())
@@ -85,81 +98,47 @@ impl ToolCheck {
             .output()
             .map(|output| {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                stdout
-                    .lines()
-                    .filter(|line| line.contains("installed"))
-                    .map(|line| line.to_string())
-                    .collect::<Vec<_>>()
+                to_string_vec(stdout.lines().filter(|line| line.contains("installed")))
             })?;
 
-        let missing_components = required
-            .iter()
-            .filter(|component| !contains_prefix(&installed_components, component))
-            .map(|&s| s.to_string())
-            .collect::<Vec<_>>();
-
-        if missing_components.is_empty() {
-            return Ok(());
-        }
-
-        println!(
-            "The following components are required but not installed for toolchain {toolchain}: {missing_components:?}"
-        );
-        if !confirm("Install them now?")? {
-            bail!(
-                "Required components not installed for toolchain {toolchain}. Please install the following components manually: {missing_components:?}"
-            );
-        }
-
-        let command = cmd!(rustup "component" "add" "--toolchain" {toolchain} {..missing_components}; "add missing components");
-        if !self.runner.run_one(command)? {
-            bail!("Failed to install missing components for toolchain {toolchain}");
-        }
+        required.retain(|component| !contains_prefix(&installed_components, component));
         Ok(())
-    }
+    };
 
-    fn subcommands<const N: usize>(&mut self, subcommands: [&str; N]) -> Result<(), anyhow::Error> {
-        let mut missing_subcommands = Vec::new();
-        for subcommand in subcommands {
-            let full_name = format!("cargo-{subcommand}");
+    Instruction::tool_check(
+        format!("{toolchain} components"),
+        to_string_vec(required),
+        remove_installed_components,
+        ("rustup", args!("component" "add" "--toolchain" {toolchain})),
+    )
+}
+
+fn check_subcommands<'a>(subcommands: impl IntoIterator<Item = &'a str>) -> Instruction {
+    let remove_installed = move |required: &mut Vec<String>| {
+        required.retain(|name| {
+            let subcommand = name.strip_prefix("cargo-").unwrap_or(name);
             let installed = Command::new("cargo")
                 .args([subcommand, "--version"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
                 .is_ok_and(|s| s.success());
-
-            if !installed {
-                missing_subcommands.push(full_name.clone());
-            }
-        }
-
-        if missing_subcommands.is_empty() {
-            return Ok(());
-        }
-
-        println!("Missing required tool(s): {missing_subcommands:?}");
-        if !confirm("Install missing tools now?")? {
-            bail!("Required tools not installed: {missing_subcommands:?}");
-        }
-
-        let command =
-            cmd!(cargo +stable "install" {..missing_subcommands}; "install missing tools");
-        if !self.runner.run_one(command)? {
-            bail!("Failed to install missing tools");
-        }
-
+            !installed
+        });
         Ok(())
-    }
-}
-
-fn confirm(prompt: &str) -> std::result::Result<bool, dialoguer::Error> {
-    dialoguer::Confirm::new()
-        .with_prompt(prompt)
-        .default(true)
-        .interact()
+    };
+    Instruction::tool_check(
+        "subcommands",
+        to_string_vec(subcommands),
+        remove_installed,
+        ("cargo", args!("install")),
+    )
 }
 
 fn contains_prefix(list: &[String], prefix: &str) -> bool {
     list.iter().any(|entry| entry.starts_with(prefix))
+}
+
+fn to_string_vec<'a>(iter: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    iter.into_iter().map(|s| s.to_string()).collect()
 }

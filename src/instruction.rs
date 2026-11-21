@@ -6,7 +6,7 @@ macro_rules! args {
             let mut args = crate::instruction::Args(Vec::new());
             $(
                 #[allow(unused_braces)]
-                args.append(crate::instruction::ArgLike::from($arg));
+                args.append($arg);
             )*
             args
         }
@@ -15,19 +15,19 @@ macro_rules! args {
 pub(crate) use args;
 
 macro_rules! cmd {
-    ( cargo +$toolchain:ident $( $arg:expr )* ; $description:literal ) => {
+    ( cargo +$toolchain:ident $( $arg:expr )* ; $description:expr ) => {
         crate::instruction::Instruction::command($description, "cargo", crate::instruction::args!(concat!("+", stringify!($toolchain)) $( $arg )* ))
     };
-    ( cargo +{$version:expr} $( $arg:expr )* ; $description:literal ) => {
+    ( cargo +{$version:expr} $( $arg:expr )* ; $description:expr ) => {
         crate::instruction::Instruction::command($description, "cargo", crate::instruction::args!(format!("+{}", $version) $( $arg )* ))
     };
 
-    ( rustup $( $arg:expr )* ; $description:literal ) => {
+    ( rustup $( $arg:expr )* ; $description:expr ) => {
         crate::instruction::Instruction::command($description, "rustup", crate::instruction::args!( $( $arg )* ))
     };
 
-    ( coverage +$toolchain:ident $( $extra_arg:expr )* ; $cov_name:literal ; $description:literal ) => {
-        crate::instruction::Instruction::coverage($description, $cov_name, concat!("+", stringify!($toolchain)), crate::instruction::args!( $( $extra_arg )* ))
+    ( coverage +$toolchain:ident $( $extra_arg:expr )* ; $cov_name:expr ; $name:expr ) => {
+        crate::instruction::Instruction::coverage($name, $cov_name, concat!("+", stringify!($toolchain)), crate::instruction::args!( $( $extra_arg )* ))
     };
 }
 pub(crate) use cmd;
@@ -39,15 +39,14 @@ macro_rules! set {
 }
 pub(crate) use set;
 
-#[derive(Debug)]
 pub enum Instruction {
     Command {
-        description: &'static str,
+        description: Cow<'static, str>,
         program: &'static str,
         args: Args,
     },
     Coverage {
-        description: &'static str,
+        name: Cow<'static, str>,
         coverage_name: &'static str,
         toolchain: &'static str,
         extra_args: Args,
@@ -56,23 +55,34 @@ pub enum Instruction {
         key: &'static str,
         value: &'static str,
     },
+    ToolCheck {
+        name: Cow<'static, str>,
+        required: Vec<String>,
+        #[expect(clippy::type_complexity, reason = "don't know what else to do")]
+        remove_installed: Box<dyn FnOnce(&mut Vec<String>) -> anyhow::Result<()> + Send>,
+        install_command: Option<(&'static str, Args)>,
+    },
 }
 impl Instruction {
-    pub fn command(description: &'static str, program: &'static str, args: Args) -> Self {
+    pub fn command(
+        description: impl Into<Cow<'static, str>>,
+        program: &'static str,
+        args: Args,
+    ) -> Self {
         Self::Command {
-            description,
+            description: description.into(),
             program,
             args,
         }
     }
     pub fn coverage(
-        description: &'static str,
+        name: impl Into<Cow<'static, str>>,
         coverage_name: &'static str,
         toolchain: &'static str,
         extra_args: Args,
     ) -> Self {
         Self::Coverage {
-            description,
+            name: name.into(),
             coverage_name,
             toolchain,
             extra_args,
@@ -81,9 +91,25 @@ impl Instruction {
     pub fn set_env(key: &'static str, value: &'static str) -> Self {
         Self::SetEnv { key, value }
     }
+    pub fn tool_check(
+        name: impl Into<Cow<'static, str>>,
+        required: Vec<String>,
+        remove_installed: impl FnOnce(&mut Vec<String>) -> anyhow::Result<()> + Send + 'static,
+        install_command: impl Into<Option<(&'static str, Args)>>,
+    ) -> Self {
+        Self::ToolCheck {
+            name: name.into(),
+            required,
+            remove_installed: Box::new(remove_installed),
+            install_command: install_command.into(),
+        }
+    }
 
     pub fn runs_command(&self) -> bool {
-        matches!(self, Self::Command { .. } | Self::Coverage { .. })
+        matches!(
+            self,
+            Self::Command { .. } | Self::Coverage { .. } | Self::ToolCheck { .. }
+        )
     }
 }
 
@@ -117,8 +143,8 @@ impl Args {
         }
     }
 
-    pub fn append(&mut self, arg: ArgLike) {
-        match arg {
+    pub fn append(&mut self, arg: impl Into<ArgLike>) {
+        match arg.into() {
             ArgLike::Arg(a) => self.0.push(a),
             ArgLike::Args(args) => self.0.extend(args.0),
         }
@@ -182,7 +208,7 @@ impl<T: Into<ArgLike>> From<std::ops::RangeTo<Vec<T>>> for ArgLike {
     fn from(range: std::ops::RangeTo<Vec<T>>) -> Self {
         let mut args = Args(vec![]);
         for t in range.end {
-            args.append(t.into());
+            args.append(t);
         }
         ArgLike::Args(args)
     }

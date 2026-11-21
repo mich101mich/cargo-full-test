@@ -6,7 +6,7 @@ use lcov::Report;
 use crate::{
     config::{Config, TestType},
     instruction::{cmd, set},
-    runner::{RunResult, Shared, TrackRunner},
+    runner::{Shared, TrackRunner},
     workspace::Workspace,
 };
 
@@ -25,20 +25,47 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
         set!(CARGO_NET_OFFLINE = "true"),
     ];
 
-    let base_instructions = [
-        cmd!(cargo +stable "test" "--workspace"; "stable test"),
-        cmd!(coverage +nightly "--workspace"; "nightly"; "nightly test coverage"),
-        cmd!(cargo +nightly "doc" "--no-deps" "--workspace"; "doc"),
-        cmd!(cargo +nightly "clippy" "--workspace" "--" "-D" "warnings"; "clippy"),
-        cmd!(cargo +stable "fmt" "--check" "--all"; "check fmt"),
-    ];
+    let tool_setup_instructions = tool_setup::setup_tools(config);
 
-    let err_span_check_instructions = config.err_span_check_test.as_ref().map(|test_name| [
-        set!(ERR_SPAN_CHECK = if config.args.frozen { "frozen" } else { "update" }),
-        cmd!(coverage +stable "--workspace" test_name "--" "--ignored"; "err_stable"; "err_span_check stable"),
-        set!(ERR_SPAN_CHECK_SPLIT_ON_CHANGE = "true"),
-        cmd!(coverage +nightly "--workspace" test_name "--" "--ignored"; "err_nightly"; "err_span_check nightly"),
-    ]);
+    let base_instructions = {
+        let mut instructions = vec![];
+        instructions.push(cmd!(coverage +stable "--workspace"; "stable"; "stable"));
+
+        for toolchain in &config.options.extra_toolchains {
+            instructions
+                .push(cmd!(cargo +{toolchain} "test" "--workspace"; format!("{toolchain} tests")));
+        }
+
+        let lint_toolchain = if config.has_nightly() {
+            // docs.rs runs nightly doc, and clippy has newer lints on nightly, so we want to use nightly if available
+            "nightly"
+        } else {
+            "stable"
+        };
+        instructions.extend([
+            cmd!(cargo +{lint_toolchain} "doc" "--no-deps" "--workspace"; "doc"),
+            cmd!(cargo +{lint_toolchain} "clippy" "--workspace" "--" "-D" "warnings"; "clippy"),
+            cmd!(cargo +stable "fmt" "--check" "--all"; "check fmt"),
+        ]);
+        instructions
+    };
+
+    let err_span_check_instructions =
+        config.options.err_span_check_test.as_ref().map(|test_name| {
+        let mut instructions = vec![];
+        if config.args.frozen {
+            instructions.push(set!(ERR_SPAN_CHECK = "frozen"));
+        }
+
+        instructions.push(cmd!(coverage +stable "--workspace" test_name "--" "--ignored"; "err_stable"; "err_span_check stable"));
+
+        if config.has_nightly() {
+            instructions.push(set!(ERR_SPAN_CHECK_SPLIT_ON_CHANGE = "true"));
+            instructions.push(cmd!(coverage +nightly "--workspace" test_name "--" "--ignored"; "err_nightly"; "err_span_check nightly"));
+        }
+
+        instructions
+    });
 
     let msrv_setup = {
         let mut setup = vec![
@@ -46,7 +73,7 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
             cmd!(cargo +{config.msrv} "update"; "cargo update"),
         ];
 
-        setup.extend(config.msrv_overrides.iter().map(
+        setup.extend(config.options.msrv_overrides.iter().map(
             |ovr| cmd!(cargo +{config.msrv} "update" "--package" {&ovr.package} "--precise" {&ovr.version}; "msrv override update"),
         ));
 
@@ -67,10 +94,13 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
         set!(CARGO_NET_OFFLINE = "true"), // we can set this now that fetch is complete
     ];
 
-    let min_versions_instructions = [
-        cmd!(cargo +stable "test" "--workspace"; "stable test"),
-        cmd!(cargo +nightly "test" "--workspace"; "nightly test"),
-    ];
+    let min_versions_instructions = {
+        let mut instructions = vec![cmd!(cargo +stable "test" "--workspace"; "stable test")];
+        if config.has_nightly() {
+            instructions.push(cmd!(cargo +nightly "test" "--workspace"; "nightly test"));
+        }
+        instructions
+    };
 
     // Step 2: Create workspaces and runners
 
@@ -81,7 +111,7 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
     fs_err::create_dir_all(&cov_base_dir)?;
 
     let shared = Arc::new(Shared {
-        base_dir: config.base_dir.clone(),
+        config: config.clone(),
         log_dir,
         cov_base_dir,
         multi_progress: indicatif::MultiProgress::new(),
@@ -95,9 +125,10 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
         Arc::clone(&shared),
         base_workspace.clone(),
         [],
-        [],
+        tool_setup_instructions,
     )?;
-    tool_setup::setup_tools(config, tool_setup_runner)?;
+
+    let mut result = tool_setup_runner.run_instructions()?;
 
     let msrv_dir_name = format!("msrv_{}", config.msrv);
 
@@ -124,7 +155,7 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
         (vec![], base_setup) // base setup is run by err_span_check_runner if needed
     };
 
-    let mut base_runner = if config.should_run(TestType::Base) {
+    let mut base_runner = if config.should_run(TestType::Base) && result.success {
         Some(TrackRunner::new(
             "base",
             "Base",
@@ -137,7 +168,7 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
         None
     };
 
-    let mut msrv_runner = if config.should_run(TestType::Msrv) {
+    let mut msrv_runner = if config.should_run(TestType::Msrv) && result.success {
         Some(TrackRunner::new(
             "msrv",
             format!("MSRV {}", config.msrv),
@@ -150,7 +181,7 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
         None
     };
 
-    let mut min_versions_runner = if config.should_run(TestType::MinVersions) {
+    let mut min_versions_runner = if config.should_run(TestType::MinVersions) && result.success {
         Some(TrackRunner::new(
             "min_versions",
             "MinVersions",
@@ -164,6 +195,7 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
     };
 
     let mut err_span_check_runner = if config.should_run(TestType::ErrSpanCheck)
+        && result.success
         && let Some(instructions) = err_span_check_instructions
     {
         Some(TrackRunner::new(
@@ -179,7 +211,6 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
     };
 
     // Step 3: Run setup instructions sequentially
-    let mut result = RunResult::default();
     for runner in [
         base_runner.as_mut(),
         msrv_runner.as_mut(),
@@ -294,7 +325,9 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
                 .context("Failed to write to merged coverage file")?;
         }
 
-        let relative_path = merged_cov_path.strip_prefix(&shared.base_dir).unwrap(); // unwrap: path was created through `join`s
+        let relative_path = merged_cov_path
+            .strip_prefix(&shared.config.base_dir)
+            .unwrap(); // unwrap: path was created through `join`s
         println!("Merged coverage report: {}", relative_path.display());
     }
 

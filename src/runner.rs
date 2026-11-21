@@ -20,8 +20,8 @@ use crate::{
 
 #[derive(Debug)]
 pub struct Shared {
-    /// Base directory of the project.
-    pub base_dir: PathBuf,
+    /// The configuration of the full test suite.
+    pub config: crate::config::Config,
     /// Directory for storing log files.
     pub log_dir: PathBuf,
     /// Directory for storing coverage output.
@@ -31,7 +31,6 @@ pub struct Shared {
 }
 
 /// Execution context for a single track (e.g. `Setup`, `Base`, `MSRV`, `MinVersions`).
-#[derive(Debug)]
 pub struct TrackRunner {
     /// Display name for the track (e.g., `"Base"`).
     pub display_name: Cow<'static, str>,
@@ -169,7 +168,7 @@ impl TrackRunner {
     /// and updating the live spinner with the most recent output line.
     fn run_cmd(&mut self, description: &str, program: &str, args: Args) -> Result<bool> {
         let mut cmd_str = program.to_owned();
-        args.write_to(&mut cmd_str, &self.shared.base_dir);
+        args.write_to(&mut cmd_str, &self.shared.config.base_dir);
 
         self.commands.push(cmd_str.clone());
 
@@ -299,16 +298,23 @@ impl TrackRunner {
                 program,
                 args,
             } => {
-                if !self.run_cmd(description, program, args)? {
-                    return Ok(false);
-                }
+                return self.run_cmd(&description, program, args);
             }
             Instruction::Coverage {
-                description,
+                name,
                 coverage_name,
                 toolchain,
                 extra_args,
             } => {
+                if !self.shared.config.options.run_coverage {
+                    // Fall back to just running the tests without coverage
+                    let description = format!("{name} tests");
+                    let args = args!("test" {..extra_args});
+                    return self.run_cmd(&description, "cargo", args);
+                }
+
+                let description = format!("{name} test coverage");
+
                 let coverage_dir = self.shared.cov_base_dir.join(coverage_name);
                 fs_err::create_dir_all(&coverage_dir)?;
 
@@ -316,7 +322,7 @@ impl TrackRunner {
 
                 let args = args!(toolchain "llvm-cov" "test" "--lcov" "--output-path" {coverage_file.clone()} {..extra_args});
 
-                if !self.run_cmd(description, "cargo", args)? {
+                if !self.run_cmd(&description, "cargo", args)? {
                     return Ok(false);
                 }
 
@@ -327,6 +333,52 @@ impl TrackRunner {
             }
             Instruction::SetEnv { key, value } => {
                 self.set_env(key, value);
+            }
+            Instruction::ToolCheck {
+                name,
+                mut required,
+                remove_installed,
+                install_command,
+            } => {
+                self.pb.set_message(format!("Checking required {name}"));
+
+                let success_name = format!("check required {name}: {required:?}");
+
+                remove_installed(&mut required)?;
+
+                if required.is_empty() {
+                    self.commands.push(success_name);
+                    return Ok(true);
+                }
+
+                let Some((program, mut args)) = install_command else {
+                    self.failed_output = Some(format!(
+                        "Missing required {name}: {required:?}. Please install them."
+                    ));
+                    return Ok(false);
+                };
+
+                let confirmed = self.shared.config.args.yes
+                    || self.pb.suspend(|| {
+                        println!(
+                            "The following {name} are required but not installed: {required:?}"
+                        );
+                        dialoguer::Confirm::new()
+                            .with_prompt("Install now?")
+                            .default(true)
+                            .interact_opt()
+                            .map(|opt| opt.unwrap_or(false))
+                    })?;
+
+                if !confirmed {
+                    self.failed_output = Some(format!(
+                        "Required {name} not installed. Please install them manually: {required:?}"
+                    ));
+                    return Ok(false);
+                }
+
+                args.append(..required);
+                return self.run_cmd(&format!("Install required {name}"), program, args);
             }
         }
 
