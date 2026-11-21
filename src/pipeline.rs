@@ -20,7 +20,7 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
     let base_setup = vec![
         set!(CARGO_BUILD_WARNINGS = "deny"),
         set!(RUSTDOCFLAGS = "-D warnings"),
-        cmd!(cargo +stable "update"; "cargo update"),
+        cmd!(cargo +stable "update" "--ignore-rust-version"; "cargo update"), // --ignore-rust-version, because cargo by default limits to our MSRV
         cmd!(cargo +stable "fetch"; "cargo fetch"),
         set!(CARGO_NET_OFFLINE = "true"),
     ];
@@ -62,7 +62,7 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
 
     let min_versions_setup = [
         set!(CARGO_BUILD_WARNINGS = "deny"),
-        cmd!(cargo +nightly "-Z" "minimal-versions" "update"; "minimal-versions update"),
+        cmd!(cargo +nightly "-Z" "minimal-versions" "update" "--ignore-rust-version"; "minimal-versions update"),
         cmd!(cargo +stable "fetch"; "cargo fetch"),
         set!(CARGO_NET_OFFLINE = "true"), // we can set this now that fetch is complete
     ];
