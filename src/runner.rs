@@ -71,6 +71,14 @@ impl std::ops::BitAndAssign for RunResult {
         self.coverage_reports.extend(rhs.coverage_reports);
     }
 }
+impl Default for RunResult {
+    fn default() -> Self {
+        Self {
+            success: true,
+            coverage_reports: Vec::new(),
+        }
+    }
+}
 
 impl TrackRunner {
     /// Creates a new [`TrackRunner`] attached to `multi_progress`.
@@ -240,7 +248,7 @@ impl TrackRunner {
         Ok(true)
     }
 
-    fn print_summary(&self) {
+    pub(crate) fn print_summary(&self) {
         self.pb.finish_and_clear();
 
         self.pb.suspend(|| {
@@ -284,49 +292,55 @@ impl TrackRunner {
         })
     }
 
+    pub(crate) fn run_one(&mut self, instruction: Instruction) -> Result<bool> {
+        match instruction {
+            Instruction::Command {
+                description,
+                program,
+                args,
+            } => {
+                if !self.run_cmd(description, program, args)? {
+                    return Ok(false);
+                }
+            }
+            Instruction::Coverage {
+                description,
+                coverage_name,
+                toolchain,
+                extra_args,
+            } => {
+                let coverage_dir = self.shared.cov_base_dir.join(coverage_name);
+                fs_err::create_dir_all(&coverage_dir)?;
+
+                let coverage_file = coverage_dir.join("lcov.info");
+
+                let args = args!(toolchain "llvm-cov" "test" "--lcov" "--output-path" {coverage_file.clone()} {..extra_args});
+
+                if !self.run_cmd(description, "cargo", args)? {
+                    return Ok(false);
+                }
+
+                let report =
+                    Report::from_file(&coverage_file).context("Failed to read coverage report")?;
+
+                self.coverage_reports.push(report);
+            }
+            Instruction::SetEnv { key, value } => {
+                self.set_env(key, value);
+            }
+        }
+
+        Ok(true)
+    }
+
     fn run_instructions_internal(&mut self, instructions: Vec<Instruction>) -> Result<bool> {
         self.pb.set_position(self.commands.len() as u64);
         let mut success = true;
         for instruction in instructions {
-            match instruction {
-                Instruction::Command {
-                    description,
-                    program,
-                    args,
-                } => {
-                    if !self.run_cmd(description, program, args)? {
-                        success = false;
-                        break;
-                    }
-                }
-                Instruction::Coverage {
-                    description,
-                    coverage_name,
-                    toolchain,
-                    extra_args,
-                } => {
-                    let coverage_dir = self.shared.cov_base_dir.join(coverage_name);
-                    fs_err::create_dir_all(&coverage_dir)?;
-
-                    let coverage_file = coverage_dir.join("lcov.info");
-
-                    let args = args!(toolchain "llvm-cov" "test" "--lcov" "--output-path" {coverage_file.clone()} {..extra_args});
-
-                    if !self.run_cmd(description, "cargo", args)? {
-                        success = false;
-                        break;
-                    }
-
-                    let report = Report::from_file(&coverage_file)
-                        .context("Failed to read coverage report")?;
-
-                    self.coverage_reports.push(report);
-                }
-                Instruction::SetEnv { key, value } => {
-                    self.set_env(key, value);
-                }
+            if !self.run_one(instruction)? {
+                success = false;
+                break;
             }
-
             self.pb.set_position(self.commands.len() as u64);
         }
         Ok(success)

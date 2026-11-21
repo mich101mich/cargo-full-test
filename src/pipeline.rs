@@ -1,32 +1,22 @@
-use std::{
-    process::{Command, Stdio},
-    sync::Arc,
-    time::Instant,
-};
+use std::{sync::Arc, time::Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use lcov::Report;
 
 use crate::{
     config::{Config, TestType},
-    instruction::*,
-    runner::{Shared, TrackRunner},
+    instruction::{cmd, set},
+    runner::{RunResult, Shared, TrackRunner},
     workspace::Workspace,
 };
+
+mod tool_setup;
 
 /// Runs the full test pipeline (Setup -> Parallel Base / MSRV / Minimal-Versions -> Summary).
 pub fn run_pipeline(config: &Config) -> Result<()> {
     let start_time = Instant::now();
 
     // Step 1: Declare instructions
-    let setup_instructions = [
-        cmd!(rustup "update" "--no-self-update"; "rustup update"), // We can't self-update from inside a cargo subcommand
-        cmd!(rustup "install" "--no-self-update" "stable" "nightly" {&config.msrv}; "rustup install"),
-        cmd!(rustup "component" "add" "--toolchain" "stable" "rustfmt" "rust-src" "llvm-tools-preview"; "add stable components"),
-        cmd!(rustup "component" "add" "--toolchain" "nightly" "clippy" "rust-src" "llvm-tools-preview"; "add nightly components"),
-        cmd!(cargo +stable "install" "cargo-llvm-cov"; "install cargo-llvm-cov"),
-    ];
-
     let base_setup = vec![
         set!(CARGO_BUILD_WARNINGS = "deny"),
         set!(RUSTDOCFLAGS = "-D warnings"),
@@ -82,9 +72,7 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
         cmd!(cargo +nightly "test" "--workspace"; "nightly test"),
     ];
 
-    // Step 2: Run global setup
-
-    verify_required_executables()?;
+    // Step 2: Create workspaces and runners
 
     // Ensure directories exist
     let log_dir = config.base_dir.join("target").join("log");
@@ -101,18 +89,15 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
 
     let base_workspace = Workspace::new_base_dir(&config.base_dir);
 
-    let setup_runner = TrackRunner::new(
+    let tool_setup_runner = TrackRunner::new(
         "setup",
         "Setup",
         Arc::clone(&shared),
         base_workspace.clone(),
         [],
-        setup_instructions,
+        [],
     )?;
-
-    let mut result = setup_runner.run_instructions()?;
-
-    // Step 3: Create workspaces and runners
+    tool_setup::setup_tools(config, tool_setup_runner)?;
 
     let msrv_dir_name = format!("msrv_{}", config.msrv);
 
@@ -193,7 +178,8 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
         None
     };
 
-    // Step 4: Run setup instructions sequentially
+    // Step 3: Run setup instructions sequentially
+    let mut result = RunResult::default();
     for runner in [
         base_runner.as_mut(),
         msrv_runner.as_mut(),
@@ -207,7 +193,7 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
         }
     }
 
-    // Step 5: Run main instructions in parallel
+    // Step 4: Run main instructions in parallel
     if result.success {
         std::thread::scope(|s| -> Result<()> {
             let handles = [base_runner, msrv_runner, min_versions_runner]
@@ -223,14 +209,14 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
         })?;
     }
 
-    // Step 6: Run ErrSpanCheck instructions if applicable
+    // Step 5: Run ErrSpanCheck instructions if applicable
     if result.success
         && let Some(err_span_check_runner) = err_span_check_runner
     {
         result &= err_span_check_runner.run_instructions()?;
     }
 
-    // Step 7: Completion Summary
+    // Step 6: Completion Summary
     let elapsed = start_time.elapsed().as_secs();
     if result.success {
         let scope = if config.has_track_selection() {
@@ -244,7 +230,7 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
     }
 
     if !result.coverage_reports.is_empty() {
-        // Step 8: Coverage Report
+        // Step 7: Coverage Report
         let mut report = Report::new();
         for part_report in result.coverage_reports {
             report
@@ -312,21 +298,5 @@ pub fn run_pipeline(config: &Config) -> Result<()> {
         println!("Merged coverage report: {}", relative_path.display());
     }
 
-    Ok(())
-}
-
-fn verify_required_executables() -> Result<()> {
-    for cmd in ["rustup", "cargo", "git"] {
-        let ok = Command::new(cmd)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
-
-        if !ok {
-            bail!("cargo-full-test requires command '{cmd}' in PATH. Please install it.");
-        }
-    }
     Ok(())
 }

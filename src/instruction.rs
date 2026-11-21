@@ -16,25 +16,25 @@ pub(crate) use args;
 
 macro_rules! cmd {
     ( cargo +$toolchain:ident $( $arg:expr )* ; $description:literal ) => {
-        Instruction::command($description, "cargo", args!(concat!("+", stringify!($toolchain)) $( $arg )* ))
+        crate::instruction::Instruction::command($description, "cargo", crate::instruction::args!(concat!("+", stringify!($toolchain)) $( $arg )* ))
     };
     ( cargo +{$version:expr} $( $arg:expr )* ; $description:literal ) => {
-        Instruction::command($description, "cargo", args!(format!("+{}", $version) $( $arg )* ))
+        crate::instruction::Instruction::command($description, "cargo", crate::instruction::args!(format!("+{}", $version) $( $arg )* ))
     };
 
     ( rustup $( $arg:expr )* ; $description:literal ) => {
-        Instruction::command($description, "rustup", args!( $( $arg )* ))
+        crate::instruction::Instruction::command($description, "rustup", crate::instruction::args!( $( $arg )* ))
     };
 
     ( coverage +$toolchain:ident $( $extra_arg:expr )* ; $cov_name:literal ; $description:literal ) => {
-        Instruction::coverage($description, $cov_name, concat!("+", stringify!($toolchain)), args!( $( $extra_arg )* ))
+        crate::instruction::Instruction::coverage($description, $cov_name, concat!("+", stringify!($toolchain)), crate::instruction::args!( $( $extra_arg )* ))
     };
 }
 pub(crate) use cmd;
 
 macro_rules! set {
     ( $key:ident = $value:expr ) => {
-        Instruction::set_env(stringify!($key), $value)
+        crate::instruction::Instruction::set_env(stringify!($key), $value)
     };
 }
 pub(crate) use set;
@@ -176,5 +176,14 @@ impl From<PathBuf> for ArgLike {
 impl From<std::ops::RangeTo<Args>> for ArgLike {
     fn from(range: std::ops::RangeTo<Args>) -> Self {
         ArgLike::Args(range.end)
+    }
+}
+impl<T: Into<ArgLike>> From<std::ops::RangeTo<Vec<T>>> for ArgLike {
+    fn from(range: std::ops::RangeTo<Vec<T>>) -> Self {
+        let mut args = Args(vec![]);
+        for t in range.end {
+            args.append(t.into());
+        }
+        ArgLike::Args(args)
     }
 }
